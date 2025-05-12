@@ -32,11 +32,11 @@ from ...tokenization_utils_base import PreTokenizedInput, TextInput
 from ...video_utils import VideoInput
 
 
-class Qwen2_5_VLVideosProcessorKwargs(VideosKwargs, total=False):
+class LeL2_VideosProcessorKwargs(VideosKwargs, total=False):
     fps: Union[List[float], float]
 
 
-class Qwen2_5_VLImagesKwargs(ImagesKwargs):
+class LeL2_ImagesKwargs(ImagesKwargs):
     min_pixels: Optional[int]
     max_pixels: Optional[int]
     patch_size: Optional[int]
@@ -44,9 +44,9 @@ class Qwen2_5_VLImagesKwargs(ImagesKwargs):
     merge_size: Optional[int]
 
 
-class Qwen2_5_VLProcessorKwargs(ProcessingKwargs, total=False):
-    images_kwargs: Qwen2_5_VLImagesKwargs
-    videos_kwargs: Qwen2_5_VLVideosProcessorKwargs
+class LeL2_ProcessorKwargs(ProcessingKwargs, total=False):
+    images_kwargs: LeL2_ImagesKwargs
+    videos_kwargs: LeL2_VideosProcessorKwargs
     _defaults = {
         "text_kwargs": {
             "padding": False,
@@ -55,17 +55,17 @@ class Qwen2_5_VLProcessorKwargs(ProcessingKwargs, total=False):
     }
 
 
-class Qwen2_5_VLProcessor(ProcessorMixin):
+class LeL2_Processor(ProcessorMixin):
     r"""
     Constructs a Qwen2.5-VL processor which wraps a Qwen2.5-VL image processor and a Qwen2 tokenizer into a single processor.
-    [`Qwen2_5_VLProcessor`] offers all the functionalities of [`Qwen2VLImageProcessor`] and [`Qwen2TokenizerFast`]. See the
-    [`~Qwen2_5_VLProcessor.__call__`] and [`~Qwen2_5_VLProcessor.decode`] for more information.
+    [`LeL2_Processor`] offers all the functionalities of [`Qwen2VLImageProcessor`] and [`Qwen2TokenizerFast`]. See the
+    [`~LeL2_Processor.__call__`] and [`~LeL2_Processor.decode`] for more information.
     Args:
         image_processor ([`Qwen2VLImageProcessor`], *optional*):
             The image processor is a required input.
         tokenizer ([`Qwen2TokenizerFast`], *optional*):
             The tokenizer is a required input.
-        video_processor ([`Qwen2_5_VLVideoProcessor`], *optional*):
+        video_processor ([`LeL2_VideoProcessor`], *optional*):
             The video processor is a required input.
         chat_template (`str`, *optional*): A Jinja template which will be used to convert lists of messages
             in a chat into a tokenizable string.
@@ -98,7 +98,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         images: ImageInput = None,
         text: Union[TextInput, PreTokenizedInput, List[TextInput], List[PreTokenizedInput]] = None,
         videos: VideoInput = None,
-        **kwargs: Unpack[Qwen2_5_VLProcessorKwargs],
+        **kwargs: Unpack[LeL2_ProcessorKwargs],
     ) -> BatchFeature:
         """
         Main method to prepare for the model one or several sequences(s) and image(s). This method forwards the `text`
@@ -138,7 +138,7 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
             - **second_per_grid_ts** -- List of video seconds per time grid. Returned when `videos` is not `None`.
         """
         output_kwargs = self._merge_kwargs(
-            Qwen2_5_VLProcessorKwargs,
+            LeL2_ProcessorKwargs,
             tokenizer_init_kwargs=self.tokenizer.init_kwargs,
             **kwargs,
         )
@@ -242,4 +242,4 @@ class Qwen2_5_VLProcessor(ProcessorMixin):
         return names_from_processor + ["second_per_grid_ts"]
 
 
-__all__ = ["Qwen2_5_VLProcessor"]
+__all__ = ["LeL2_Processor"]
