@@ -1391,6 +1391,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
+        # self.number_encoder = nn.Linear(1, config.hidden_size, bias=False) #added
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1587,6 +1588,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        numbers_values: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -1626,6 +1628,12 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
+            numbers_embeds = torch.ones_like(input_ids)
+            
+            # numbers_embeds = self.number_encoder(numbers_values) #added
+            number_mask = (input_ids==self.config.input_ids)
+            numbers_embeds = numbers_embeds.masked_scatter(number_mask, numbers_embeds)
+            inputs_embeds = inputs_embeds*numbers_embeds
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -1769,6 +1777,8 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.routing_head = nn.Linear(config.hidden_size, 2, bias=False) #added
+        self.numbers_head = nn.Linear(config.hidden_size, 1, bias=False) #added
 
         self.post_init()
 
@@ -1877,7 +1887,8 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.model(
-            input_ids=input_ids,
+            input_ids=input_ids, 
+            number_ids, # ToDo : ajouter number_ids partout pour propager
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -1895,8 +1906,10 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         )
 
         hidden_states = outputs[0]
-        logits = self.lm_head(hidden_states)
-
+        lm_logits = self.lm_head(hidden_states)
+        numbers = self.numbers_head(hidden_states)
+        # ToDo ajouter les loss et modifier la sortie en fonction de la route choisi/proba apprise a voir
+        
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
@@ -1917,6 +1930,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids,
+        number_ids,
         past_key_values=None,
         attention_mask=None,
         inputs_embeds=None,
@@ -1934,6 +1948,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
 
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
+            number_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
