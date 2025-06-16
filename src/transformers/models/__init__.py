@@ -343,6 +343,7 @@ if TYPE_CHECKING:
     from .zamba import *
     from .zamba2 import *
     from .zoedepth import *
+    from .lel2 import *
 else:
     import sys
 
