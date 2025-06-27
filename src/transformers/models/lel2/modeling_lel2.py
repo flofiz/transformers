@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import MLP
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -50,6 +51,7 @@ from ...generation.configuration_utils import (
     GenerationMode,
 )
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+import warnings
 from ...generation.utils import GenerateOutput, GenerateNonBeamOutput
 from ...integrations.deepspeed import is_deepspeed_zero3_enabled
 from ...integrations.fsdp import is_fsdp_managed_module
@@ -139,7 +141,6 @@ class Qwen2RMSNorm(nn.Module):
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         return self.weight * hidden_states.to(input_dtype)
-
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
@@ -1403,8 +1404,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
-        # self.number_encoder = nn.Linear(1, config.hidden_size, bias=False) #added
-
+        self.number_encoder = nn.Linear(4, config.hidden_size, bias=False) #added
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1596,7 +1596,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
             return position_ids, mrope_position_deltas
 
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1640,13 +1640,20 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings()(input_ids)
-            numbers_embeds = torch.ones_like(input_ids)
             
-            # numbers_embeds = self.number_encoder(numbers_values) #added
-            numbers_mask = (input_ids==self.config.number_token_id)
             if number_ids is not None:
-                numbers_embeds = numbers_embeds.masked_scatter(numbers_mask, number_ids)
-                inputs_embeds = inputs_embeds*numbers_embeds
+                # if number_ids.shape==input_ids.shape:
+                #     numbers_embeds = number_ids.to(inputs_embeds.dtype).unsqueeze(-1)
+                # else:
+                #     numbers_embeds = torch.ones_like(input_ids, dtype = inputs_embeds.dtype)
+                #     # numbers_embeds = self.number_encoder(numbers_values) #added
+                #     numbers_mask = (input_ids==self.config.number_token_id)
+                #     numbers_embeds = numbers_embeds.masked_scatter(numbers_mask, number_ids.to(numbers_embeds.dtype)).unsqueeze(-1)
+                #     print("dtype = ", number_ids.shape, input_ids.shape(), flush = True)
+                numbers_embeds = self.number_encoder(number_ids)
+                numbers_mask = (input_ids==self.config.number_token_id)
+                inputs_embeds = torch.where(numbers_mask.unsqueeze(-1), inputs_embeds*numbers_embeds, inputs_embeds)
+                # inputs_embeds = inputs_embeds*numbers_embeds
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
                 image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
@@ -1779,6 +1786,18 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     attentions: Optional[Tuple[torch.FloatTensor]] = None
     rope_deltas: Optional[torch.LongTensor] = None
 
+# Instead of using nn.MLP, define the equivalent with Linear layers
+class LeLNumberHead(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.activation = nn.GELU()  # or whatever activation you were using
+        self.linear2 = nn.Linear(hidden_dim, output_dim)
+        
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        return self.linear2(x)
 
 class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {
@@ -1792,7 +1811,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.routing_head = nn.Linear(config.hidden_size, 2, bias=False) #added
-        self.numbers_head = nn.Linear(config.hidden_size, 1, bias=False) #added
+        self.numbers_head = LeLNumberHead(config.hidden_size,config.hidden_size, 4) #added
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1823,7 +1842,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         return self.model.visual
 
     @can_return_tuple
-    @auto_docstring
+    # @auto_docstring
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1922,11 +1941,14 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits_number = self.numbers_head(hidden_states)
-        # ToDo ajouter les loss et modifier la sortie en fonction de la route choisi/proba apprise a voir
         
         loss = None
         if labels is not None:
-            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
+            lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
+            number_mask = (labels == self.config.number_token_id).unsqueeze(-1)
+            # number_loss = torch.sum(F.smooth_l1_loss(input=logits_number[:,:-1].squeeze(-1)*number_mask[:,1:],target=number_ids[:,1:]*number_mask[:,1:], reduction="none"))/torch.sum(number_mask)
+            number_loss = number_loss_fn(logits_number, number_ids, number_mask)
+            loss = 0.9*lm_loss + 0.1*number_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1960,7 +1982,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         **kwargs,
     ):
         # Overwritten -- in specific circumstances we don't want to forward image inputs to the model
-
+    
         model_inputs = super().prepare_inputs_for_generation(
             input_ids,
             past_key_values=past_key_values,
@@ -1976,15 +1998,61 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **kwargs,
         )
-
-        # Qwen2-5-VL position_ids are prepareed with rope_deltas in forward
+    
+        # Qwen2-5-VL position_ids are prepared with rope_deltas in forward
         model_inputs["position_ids"] = None
-        model_inputs["number_ids"] = None
-
+        
+        # Gestion des valeurs numériques
+        if number_ids is not None and hasattr(self.config, 'number_token_id'):
+            numbers_mask = (input_ids == self.config.number_token_id)
+            
+            # Vérifier s'il y a des tokens numériques
+            if numbers_mask.any():
+                # Convertir number_ids en tenseur si nécessaire
+                if isinstance(number_ids, (list, tuple)):
+                    number_ids = torch.tensor(number_ids, dtype=number_ids.dtype, device=input_ids.device)
+                else:
+                    number_ids = number_ids.to(dtype=torch.bfloat16, device=input_ids.device)
+                
+                # Créer le tableau des valeurs numériques
+                numbers_array = torch.ones((*input_ids.shape,4), dtype=torch.bfloat16, device=input_ids.device)
+                
+                # Gestion des différents formats d'entrée
+                if number_ids[:,:,0].numel() == numbers_mask.sum().item():
+                    # Format liste: seulement les valeurs numériques
+                    numbers_array = numbers_array.masked_scatter(numbers_mask.unsqueeze(-1), number_ids)
+                elif number_ids.shape[:,:,0] == input_ids.shape:
+                    # Format tenseur complet
+                    numbers_array = number_ids
+                else:
+                    print(f"Warning: Format number_ids incompatible: {number_ids.shape} vs input_ids: {input_ids.shape}")
+                    model_inputs["number_ids"] = None
+                    
+                # Extraire les positions courantes et vérifier s'il y a des tokens numériques
+                if "number_ids" not in model_inputs or model_inputs["number_ids"] is not None:
+                    current_numbers = torch.index_select(numbers_array, 1, cache_position)
+                    current_mask = torch.index_select(numbers_mask, 1, cache_position)
+                    
+                    # Si pas de tokens numériques dans les positions courantes, mettre à None
+                    model_inputs["number_ids"] = current_numbers if current_mask.any() else None
+            else:
+                # Pas de tokens numériques trouvés
+                model_inputs["number_ids"] = None
+        else:
+            # number_ids est None ou pas de configuration
+            model_inputs["number_ids"] = None
+        
         if cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_values_videos"] = None
-
+        
+        # Debug optionnel (décommente si besoin)
+        # print("\n"*2,"-"*40,"dim avant generation")
+        # print("input_ids :", input_ids.shape if input_ids is not None else None)
+        # print("number_ids :", model_inputs["number_ids"].shape if model_inputs["number_ids"] is not None else None)
+        # print("cache_position :", cache_position.shape if cache_position is not None else None)
+        # print("-"*40,"\n"*2)
+        
         return model_inputs
 
     def _get_image_nums_and_video_nums(
@@ -2027,6 +2095,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         # e.g., pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw, second_per_grid_t
         # pixel_values.shape[0] is sum(seqlen_images for samples)
         # image_grid_thw.shape[0] is sum(num_images for samples)
+        # ToDo : ajouté la gestion des chiffres
 
         if expand_size == 1:
             return input_ids, model_kwargs
@@ -2270,13 +2339,12 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         """
 
         # 1. Handle `generation_config` and kwargs that might update it, and validate the `.generate()` call
-        print("generate here", flush = True)
         tokenizer = kwargs.pop("tokenizer", None)  # Pull this out first, we only use it for stopping criteria
         assistant_tokenizer = kwargs.pop("assistant_tokenizer", None)  # only used for assisted generation
 
         generation_config, model_kwargs = self._prepare_generation_config(
             generation_config, use_model_defaults, **kwargs
-        )
+        ) # ToDo : ajouter la gestion des chiffres dans prepare
         self._validate_model_kwargs(model_kwargs.copy())
         self._validate_assistant(assistant_model, tokenizer, assistant_tokenizer)
 
@@ -2347,6 +2415,8 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             )
         else:
             input_ids = inputs_tensor if model_input_name == "input_ids" else model_kwargs.pop("input_ids")
+            number_ids = model_kwargs.pop("number_ids", None)
+            
 
         if generation_config.token_healing:
             input_ids = self.heal_tokens(input_ids, tokenizer)
@@ -2442,6 +2512,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             # 12. run sample (it degenerates to greedy search when `generation_config.do_sample=False`)
             result = self._sample(
                 input_ids,
+                number_ids,
                 logits_processor=prepared_logits_processor,
                 stopping_criteria=prepared_stopping_criteria,
                 generation_config=generation_config,
@@ -2461,6 +2532,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     def _sample(
         self,
         input_ids: torch.LongTensor,
+        number_ids,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
@@ -2545,7 +2617,8 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
 
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
             # prepare model inputs
-            model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
+            model_inputs = self.prepare_inputs_for_generation(input_ids, number_ids, **model_kwargs)
+            # print("model input :",model_inputs,"\n","-"*40,"\nmodel_kwargs :",model_kwargs, "\n","-"*40,"\ninput ids :", input_ids, flush = True)
 
             # prepare variable output controls (note: some models won't accept all output controls)
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
@@ -2569,7 +2642,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             # Copy is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
             next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
-            next_number_logits = outputs.logits_number[:, -1].to(copy=True, dtype=torch.float32, device=input_ids.device).flatten()
+            next_number_logits = outputs.logits_number[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
 
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
@@ -2601,15 +2674,20 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
             else:
                 next_tokens = torch.argmax(next_token_scores, dim=-1)
-            print("before",next_tokens.shape)
-            next_tokens = torch.where(next_tokens == self.config.number_token_id, next_number_logits, next_tokens) #ToDo fournir au modele les chiffres et le texte separement
-            print("after", next_tokens.shape)
+            # next_tokens = torch.where(next_tokens == self.config.number_token_id, next_number_logits, next_tokens) #ToDo fournir au modele les chiffres et le texte separement
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
+            if next_tokens == self.config.number_token_id:
+                if number_ids is not None:
+                    number_ids = torch.cat([number_ids, next_number_logits[:, None]], dim=1)
+                else:
+                    number_ids = next_number_logits[:,None]
+                print(number_ids.shape, flush = True)
+                    
             if streamer is not None:
                 streamer.put(next_tokens.cpu())
 
@@ -2647,7 +2725,19 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            return input_ids, number_ids
+def number_loss_fn(logits, targets, mask):
+    per_element_loss = F.smooth_l1_loss(
+        input=logits[:,:-1].squeeze(-1)*mask[:,1:],
+        target=targets[:,1:]*mask[:,1:], 
+        reduction="none"
+    )
+    mask_sum = torch.sum(mask)
+    
+    if mask_sum > 0:
+        return torch.sum(per_element_loss) / (mask_sum*4)
+    else:
+        return torch.tensor(0.0, device=logits.device)  # Retourne 0 si pas d'éléments
 
 
 
