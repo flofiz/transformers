@@ -31,7 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.ops import MLP
+from torchvision.ops import MLP, generalized_box_iou_loss
 
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, SlidingWindowCache, StaticCache
@@ -1779,6 +1779,8 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     """
 
     loss: Optional[torch.FloatTensor] = None
+    lm_loss: Optional[torch.FloatTensor] = None
+    coord_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     logits_number: Optional[torch.FloatTensor] = None
     past_key_values: Optional[List[torch.FloatTensor]] = None
@@ -1791,13 +1793,25 @@ class LeLNumberHead(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
         super().__init__()
         self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.GELU()  # or whatever activation you were using
+        self.activation = nn.GELU()
         self.linear2 = nn.Linear(hidden_dim, output_dim)
         
     def forward(self, x):
         x = self.linear1(x)
         x = self.activation(x)
         return self.linear2(x)
+    
+    def half(self):
+        """Méthode pour la compatibilité avec les conversions de dtype"""
+        self.linear1 = self.linear1.half()
+        self.linear2 = self.linear2.half()
+        return self
+        
+    def float(self):
+        """Méthode pour la compatibilité avec les conversions de dtype"""
+        self.linear1 = self.linear1.float()
+        self.linear2 = self.linear2.float()
+        return self
 
 class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {
@@ -1810,7 +1824,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         super().__init__(config)
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.routing_head = nn.Linear(config.hidden_size, 2, bias=False) #added
+        # self.routing_head = nn.Linear(config.hidden_size, 2, bias=False) #added
         self.numbers_head = LeLNumberHead(config.hidden_size,config.hidden_size, 4) #added
         self.post_init()
 
@@ -1941,21 +1955,26 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits_number = self.numbers_head(hidden_states)
-        
+        # logits_number = torch.clamp(logits_number, min = 0, max = 2)
         loss = None
+        lm_loss = None
+        coord_loss = None
         if labels is not None:
-            lm_loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
-            number_mask = (labels == self.config.number_token_id).unsqueeze(-1)
+            text_label, number_label = labels
+            lm_loss = self.loss_function(logits=logits, labels=text_label, vocab_size=self.config.vocab_size)
+            number_mask = (text_label == self.config.number_token_id).unsqueeze(-1)
             # number_loss = torch.sum(F.smooth_l1_loss(input=logits_number[:,:-1].squeeze(-1)*number_mask[:,1:],target=number_ids[:,1:]*number_mask[:,1:], reduction="none"))/torch.sum(number_mask)
-            number_loss = number_loss_fn(logits_number, number_ids, number_mask)
-            loss = 0.9*lm_loss + 0.1*number_loss
+            coord_loss = number_loss_fn(logits_number, number_label, number_mask)
+            loss = 1*lm_loss + 1*coord_loss
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
+            output = (logits,logits_number, ) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
+            lm_loss = lm_loss,
+            coord_loss = coord_loss,
             logits=logits,
             logits_number=logits_number,
             past_key_values=outputs.past_key_values,
@@ -2726,19 +2745,101 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 )
         else:
             return input_ids, number_ids
+# def number_loss_fn(logits, targets, mask):
+#     per_element_loss = F.l1_loss(
+#         input=logits[:,:-1].squeeze(-1)*mask[:,1:],
+#         target=targets[:,1:]*mask[:,1:], 
+#         reduction="none"
+#     )
+#     mask_sum = torch.sum(mask[:,1:])
+#     l1_loss = torch.sum(per_element_loss) / mask_sum
+#     tmp_logits = logits[:,:-1].contiguous().view(-1,4)
+#     tmp_targtes = targets[:,1:].contiguous().view(-1,4)
+#     flatten_mask = mask[:,1:].flatten()
+#     iou_loss = torch.mean(generalized_box_iou_loss(tmp_logits[torch.where(flatten_mask)], tmp_targtes[torch.where(flatten_mask)]))
+#     if mask_sum > 0:
+#         return iou_loss + l1_loss
+#     else:
+#         return torch.tensor(0.0, device=logits.device)  # Retourne 0 si pas d'éléments
+
 def number_loss_fn(logits, targets, mask):
-    per_element_loss = F.smooth_l1_loss(
-        input=logits[:,:-1].squeeze(-1)*mask[:,1:],
-        target=targets[:,1:]*mask[:,1:], 
-        reduction="none"
-    )
-    mask_sum = torch.sum(mask)
+    """
+    Args:
+        logits: (batch_size, seq_len, 4) - prédictions des boîtes
+        targets: (batch_size, seq_len, 4) - boîtes cibles  
+        mask: (batch_size, seq_len) ou (batch_size, seq_len, 1) - masque de validité
+    """
+    device = logits.device
     
-    if mask_sum > 0:
-        return torch.sum(per_element_loss) / (mask_sum*4)
+    # Supprimer la dernière position pour logits
+    pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4)
+    target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4)
+    valid_mask = mask[:, 1:]  # (batch_size, seq_len-1) ou (batch_size, seq_len-1, 1)
+    
+    # Gérer la dimension supplémentaire du masque si elle existe
+    if valid_mask.dim() == 3:
+        valid_mask = valid_mask.squeeze(-1)  # (batch_size, seq_len-1)
+    
+    # Vérifier que les dimensions sont cohérentes
+    assert pred_boxes.shape == target_boxes.shape, f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+    assert pred_boxes.shape[:-1] == valid_mask.shape, f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
+    
+    # Calculer le nombre total d'éléments valides
+    mask_sum = torch.sum(valid_mask)
+    
+    if mask_sum == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # === L1 Loss ===
+    # Appliquer le masque élément par élément
+    masked_pred = pred_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
+    masked_target = target_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
+    
+    per_element_loss = F.l1_loss(masked_pred, masked_target, reduction="none")  # (batch_size, seq_len-1, 4)
+    
+    # Sommer seulement sur les éléments valides
+    l1_loss = torch.sum(per_element_loss * valid_mask.unsqueeze(-1)) / (mask_sum * 4)
+    
+    # === IoU Loss ===
+    # Aplatir et filtrer les éléments valides
+    flat_pred = pred_boxes.reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
+    flat_target = target_boxes.reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
+    flat_mask = valid_mask.flatten()  # (batch_size * (seq_len-1),)
+    
+    # Extraire seulement les boîtes valides
+    valid_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(1)
+    
+    if len(valid_indices) == 0:
+        iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
     else:
-        return torch.tensor(0.0, device=logits.device)  # Retourne 0 si pas d'éléments
+        valid_pred_boxes = flat_pred[valid_indices]  # (num_valid, 4)
+        valid_target_boxes = flat_target[valid_indices]  # (num_valid, 4)
+        
+        # Vérifier que les boîtes sont dans un format valide
+        valid_pred_boxes = ensure_valid_boxes(valid_pred_boxes)
+        valid_target_boxes = ensure_valid_boxes(valid_target_boxes)
+        
+        # Calculer la perte IoU
+        try:
+            iou_loss = generalized_box_iou_loss(valid_pred_boxes, valid_target_boxes, reduction='mean')
+        except Exception as e:
+            print(f"Warning: IoU loss computation failed: {e}")
+            iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+    return 10*l1_loss + 2*iou_loss
 
-
+def ensure_valid_boxes(boxes):
+    boxes_clamped = torch.clamp(boxes, min=0.0)
+    
+    # S'assurer que x2 > x1 et y2 > y1 sans opérations in-place
+    x1, y1, x2, y2 = boxes_clamped[:, 0], boxes_clamped[:, 1], boxes_clamped[:, 2], boxes_clamped[:, 3]
+    
+    x2_fixed = torch.maximum(x2, x1 + 1e-6)
+    y2_fixed = torch.maximum(y2, y1 + 1e-6)
+    
+    # Reconstruire le tenseur sans modification in-place
+    boxes_fixed = torch.stack([x1, y1, x2_fixed, y2_fixed], dim=1)
+    
+    return boxes_fixed
 
 __all__ = ["LeL2_ForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
