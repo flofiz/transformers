@@ -1404,7 +1404,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
-        self.number_encoder = nn.Linear(4, config.hidden_size, bias=False) #added
+        self.number_encoder = nn.Linear(5, config.hidden_size, bias=False) #added
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1652,7 +1652,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 #     print("dtype = ", number_ids.shape, input_ids.shape(), flush = True)
                 numbers_embeds = self.number_encoder(number_ids)
                 numbers_mask = (input_ids==self.config.number_token_id)
-                inputs_embeds = torch.where(numbers_mask.unsqueeze(-1), inputs_embeds*numbers_embeds, inputs_embeds)
+                inputs_embeds = torch.where(numbers_mask.unsqueeze(-1), inputs_embeds * numbers_embeds, inputs_embeds)
                 # inputs_embeds = inputs_embeds*numbers_embeds
             if pixel_values is not None:
                 pixel_values = pixel_values.type(self.visual.dtype)
@@ -1780,6 +1780,9 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
 
     loss: Optional[torch.FloatTensor] = None
     lm_loss: Optional[torch.FloatTensor] = None
+    l1_loss: Optional[torch.FloatTensor] = None
+    iou_loss: Optional[torch.FloatTensor] = None
+    kld_loss: Optional[torch.FloatTensor] = None
     coord_loss: Optional[torch.FloatTensor] = None
     logits: Optional[torch.FloatTensor] = None
     logits_number: Optional[torch.FloatTensor] = None
@@ -1790,28 +1793,72 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
 
 # Instead of using nn.MLP, define the equivalent with Linear layers
 class LeLNumberHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim=None, output_dim=5, dropout=0.1, coord_scale=2.0):
         super().__init__()
-        self.linear1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.GELU()
-        self.linear2 = nn.Linear(hidden_dim, output_dim)
         
+        if hidden_dim is None:
+            hidden_dim = input_dim // 2
+            
+        self.coord_scale = coord_scale  # Échelle max des coordonnées
+        
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.activation1 = nn.GELU()
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.norm2 = nn.LayerNorm(hidden_dim // 2)
+        self.activation2 = nn.GELU()
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.linear3 = nn.Linear(hidden_dim // 2, output_dim)
+        
+        self._init_weights()
+        
+    def _init_weights(self):
+        """Initialisation adaptée aux coordonnées réelles"""
+        for module in [self.linear1, self.linear2]:
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        
+        # Initialisation plus petite pour la couche finale
+        nn.init.xavier_uniform_(self.linear3.weight, gain=0.1)
+        
+        with torch.no_grad():
+            # Biais adaptés à l'échelle réelle de vos données
+            self.linear3.bias[0] = 1.0  # cx au centre (environ 1.0 pour des coords ~[0,2])
+            self.linear3.bias[1] = 1.0  # cy au centre
+            self.linear3.bias[2] = 0.5  # largeur raisonnable
+            self.linear3.bias[3] = 0.5  # hauteur raisonnable
+            self.linear3.bias[4] = 0.0  # angle
+    
     def forward(self, x):
         x = self.linear1(x)
-        x = self.activation(x)
-        return self.linear2(x)
-    
-    def half(self):
-        """Méthode pour la compatibilité avec les conversions de dtype"""
-        self.linear1 = self.linear1.half()
-        self.linear2 = self.linear2.half()
-        return self
+        x = self.norm1(x)
+        x = self.activation1(x)
+        x = self.dropout1(x)
         
-    def float(self):
-        """Méthode pour la compatibilité avec les conversions de dtype"""
-        self.linear1 = self.linear1.float()
-        self.linear2 = self.linear2.float()
-        return self
+        x = self.linear2(x)
+        x = self.norm2(x)
+        x = self.activation2(x)
+        x = self.dropout2(x)
+        
+        x = self.linear3(x)
+        
+        # Post-traitement adapté à vos échelles
+        cx, cy, w, h, angle = x.split(1, dim=-1)
+        
+        # Appliquer sigmoid puis rescaler à [0, coord_scale]
+        cx = torch.sigmoid(cx) * self.coord_scale
+        cy = torch.sigmoid(cy) * self.coord_scale
+        w = torch.sigmoid(w) * self.coord_scale  # largeur max = coord_scale
+        h = torch.sigmoid(h) * self.coord_scale  # hauteur max = coord_scale
+        
+        # Angle normalisé dans [-π/2, π/2]
+        angle = torch.tanh(angle) * (torch.pi / 2)
+        
+        return torch.cat([cx, cy, w, h, angle], dim=-1)
 
 class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     _checkpoint_conversion_mapping = {
@@ -1825,7 +1872,28 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # self.routing_head = nn.Linear(config.hidden_size, 2, bias=False) #added
-        self.numbers_head = LeLNumberHead(config.hidden_size,config.hidden_size, 4) #added
+        self.numbers_head = LeLNumberHead(config.hidden_size,config.hidden_size, 5) #added
+        # self.localisation_loss = HybridLocalisationLoss(
+        #                     l1_weight=1.0,
+        #                     iou_weight=5.0,
+        #                     iou_type='ciou',
+        #                     coord_format='cxcywha', 
+        #                     coord_scale=2.0
+        #                 ).to(self.device)
+        # self.localisation_loss = KLDHybridLocalizationLoss(l1_weight = 10.0,
+        #          kld_weight = 1.0,
+        #          coord_format = 'xyxy',  # 'cxcywha' ou 'xyxy'
+        #          angle_normalization = 'symmetric_pi', # ou 'positive_pi' ou None
+        #          eps = 1e-7,
+        #          coord_max = 2.0).to(self.device)
+        self.localisation_loss = EnhancedKLDHybridLocalizationLoss( 
+                loss_type = 'kld',  # 'kld', 'iou', 'giou', 'diou', 'ciou', 'siou'
+                l1_weight = 10.0,
+                main_loss_weight = 1.0,
+                coord_format = 'xyxy',
+                angle_normalization = 'symmetric_pi',
+                eps = 1e-7,
+                coord_max = 2.0)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1958,13 +2026,21 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         # logits_number = torch.clamp(logits_number, min = 0, max = 2)
         loss = None
         lm_loss = None
+        l1_loss = None
+        iou_loss = None
+        kld_loss = None
         coord_loss = None
         if labels is not None:
             text_label, number_label = labels
             lm_loss = self.loss_function(logits=logits, labels=text_label, vocab_size=self.config.vocab_size)
             number_mask = (text_label == self.config.number_token_id).unsqueeze(-1)
             # number_loss = torch.sum(F.smooth_l1_loss(input=logits_number[:,:-1].squeeze(-1)*number_mask[:,1:],target=number_ids[:,1:]*number_mask[:,1:], reduction="none"))/torch.sum(number_mask)
-            coord_loss = number_loss_fn(logits_number, number_label, number_mask)
+            # coord_loss = number_loss_fn(logits_number, number_label, number_mask)
+            coord_loss = self.localisation_loss(logits_number, number_label, number_mask)
+            loss_components = self.localisation_loss.get_loss_components()
+            l1_loss = loss_components.get("l1_loss", None)
+            iou_loss = loss_components.get("iou_loss", None)
+            kld_loss = loss_components.get("kld_loss", None)
             loss = 1*lm_loss + 1*coord_loss
 
         if not return_dict:
@@ -1974,6 +2050,9 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
             lm_loss = lm_loss,
+            l1_loss = l1_loss,
+            iou_loss = iou_loss,
+            kld_loss = kld_loss,
             coord_loss = coord_loss,
             logits=logits,
             logits_number=logits_number,
@@ -2034,7 +2113,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                     number_ids = number_ids.to(dtype=torch.bfloat16, device=input_ids.device)
                 
                 # Créer le tableau des valeurs numériques
-                numbers_array = torch.ones((*input_ids.shape,4), dtype=torch.bfloat16, device=input_ids.device)
+                numbers_array = torch.ones((*input_ids.shape,5), dtype=torch.bfloat16, device=input_ids.device)
                 
                 # Gestion des différents formats d'entrée
                 if number_ids[:,:,0].numel() == numbers_mask.sum().item():
@@ -2745,6 +2824,2388 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
                 )
         else:
             return input_ids, number_ids
+
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import torchvision.ops as ops
+
+class KLDLossGaussian(nn.Module):
+    """
+    Calcule la Kullback-Leibler Divergence (KLD) entre deux distributions Gaussiennes 2D.
+    Utilisée pour la régression des boîtes englobantes orientées (OBB).
+    """
+
+    def __init__(self, eps: float = 1e-7):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, mu1: torch.Tensor, sigma1: torch.Tensor, mu2: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            mu1 (torch.Tensor): Moyennes des Gaussiennes prédites (N, 2) [cx, cy]
+            sigma1 (torch.Tensor): Matrices de covariance des Gaussiennes prédites (N, 2, 2)
+            mu2 (torch.Tensor): Moyennes des Gaussiennes cibles (N, 2) [cx, cy]
+            sigma2 (torch.Tensor): Matrices de covariance des Gaussiennes cibles (N, 2, 2)
+
+        Returns:
+            torch.Tensor: KLD Loss moyenne sur le lot.
+        """
+        # Assurer que les matrices de covariance sont inversibles et ont des déterminants positifs
+        sigma1 = sigma1 + self.eps * torch.eye(2, device=sigma1.device).unsqueeze(0)
+        sigma2 = sigma2 + self.eps * torch.eye(2, device=sigma2.device).unsqueeze(0)
+
+        # Calcul des inverses et déterminants
+        inv_sigma2 = torch.linalg.inv(sigma2)
+        det_sigma1 = torch.linalg.det(sigma1)
+        det_sigma2 = torch.linalg.det(sigma2)
+
+        # Terme de trace
+        trace_term = torch.diagonal(torch.matmul(inv_sigma2, sigma1), dim1=-2, dim2=-1).sum(-1)
+
+        # Terme de différence des moyennes
+        mu_diff = mu2 - mu1  # (N, 2)
+        mu_diff_term = torch.matmul(mu_diff.unsqueeze(1), torch.matmul(inv_sigma2, mu_diff.unsqueeze(2))).squeeze(-1).squeeze(-1)
+
+        # Terme de déterminant
+        det_term = torch.log(det_sigma2 / (det_sigma1 + self.eps))
+
+        # KLD Loss
+        kld_loss_per_box = 0.5 * (trace_term + mu_diff_term - 2 + det_term)
+
+        return torch.relu(kld_loss_per_box).mean()
+
+
+class EnhancedKLDHybridLocalizationLoss(nn.Module):
+    """
+    Loss hybride avancée pour la localisation avec choix flexible du type de loss :
+    - Choix entre KLD et différents types d'IoU (IoU, GIoU, DIoU, CIoU, SIoU)
+    - Interface simplifiée : get_loss_components() retourne toujours 'iou_loss' et 'kld_loss'
+    - Si loss principale = KLD : 'kld_loss' = loss, 'iou_loss' = métrique
+    - Si loss principale = IoU : 'iou_loss' = loss, 'kld_loss' = métrique
+    """
+
+    def __init__(self,
+                 loss_type: str = 'kld',  # 'kld', 'iou', 'giou', 'diou', 'ciou', 'siou'
+                 l1_weight: float = 1.0,
+                 main_loss_weight: float = 5.0,
+                 coord_format: str = 'cxcywha',
+                 angle_normalization: str = 'symmetric_pi',
+                 eps: float = 1e-7,
+                 coord_max: float = 1.0):
+        super().__init__()
+
+        self.loss_type = loss_type
+        self.l1_weight = l1_weight
+        self.main_loss_weight = main_loss_weight
+        self.coord_format = coord_format
+        self.angle_normalization = angle_normalization
+        self.eps = eps
+        self.coord_max = coord_max
+
+        # Validation du type de loss
+        valid_types = ['kld', 'iou', 'giou', 'diou', 'ciou', 'siou']
+        if loss_type not in valid_types:
+            raise ValueError(f"Type de loss '{loss_type}' non supporté. Utilisez: {valid_types}")
+
+        # Calculateurs de loss
+        self.kld_calculator = KLDLossGaussian(eps=eps)
+        
+        # Storage pour monitoring - interface simplifiée
+        self._last_l1_loss = None
+        self._last_iou_loss = None  # Toujours présent (loss ou métrique)
+        self._last_kld_loss = None  # Toujours présent (loss ou métrique)
+        self._last_weighted_loss = None
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        device = logits.device
+
+        # Préparation des données
+        pred_boxes = logits[:, :-1]
+        target_boxes = targets[:, 1:]
+        valid_mask = mask[:, 1:]
+
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.squeeze(-1)
+
+        self._validate_shapes(pred_boxes, target_boxes, valid_mask)
+
+        mask_sum = torch.sum(valid_mask)
+        if mask_sum == 0:
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            self._update_monitoring_values(zero_loss, zero_loss, zero_loss, zero_loss)
+            return zero_loss
+
+        # Filtrage des éléments valides
+        valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(1)
+        flat_pred = pred_boxes.reshape(-1, pred_boxes.shape[-1])
+        flat_target = target_boxes.reshape(-1, target_boxes.shape[-1])
+        valid_pred_boxes = flat_pred[valid_indices]
+        valid_target_boxes = flat_target[valid_indices]
+
+        # Calcul de la Smooth L1 Loss
+        l1_loss = F.smooth_l1_loss(valid_pred_boxes, valid_target_boxes, reduction="mean")
+
+        # Préparation des boîtes pour les calculs géométriques
+        valid_pred_boxes_processed = self._prepare_boxes_for_loss(valid_pred_boxes)
+        valid_target_boxes_processed = self._prepare_boxes_for_loss(valid_target_boxes)
+
+        # Calcul des deux types de loss/métriques
+        kld_value = self._compute_kld_loss(valid_pred_boxes_processed, valid_target_boxes_processed)
+        iou_value = self._compute_iou_metric(valid_pred_boxes_processed, valid_target_boxes_processed)
+        
+        # Si on utilise un type d'IoU comme loss principale, on recalcule avec gradients
+        if self.loss_type != 'kld':
+            iou_value = self._compute_iou_loss(valid_pred_boxes_processed, valid_target_boxes_processed, self.loss_type)
+
+        # Détermination de la loss principale
+        if self.loss_type == 'kld':
+            main_loss = kld_value
+        else:
+            main_loss = iou_value
+
+        # Calcul de la perte totale pondérée
+        weighted_loss = self.l1_weight * l1_loss + self.main_loss_weight * main_loss
+
+        # Mise à jour des valeurs de monitoring avec interface simplifiée
+        self._update_monitoring_values(l1_loss, iou_value, kld_value, weighted_loss)
+
+        return weighted_loss
+
+    def _compute_kld_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+        """Calcule la KLD loss entre les boîtes prédites et cibles."""
+        device = pred_boxes.device
+        try:
+            pred_mu, pred_sigma = self._obb_to_gaussian_params(pred_boxes)
+            target_mu, target_sigma = self._obb_to_gaussian_params(target_boxes)
+            return self.kld_calculator(pred_mu, pred_sigma, target_mu, target_sigma)
+        except Exception as e:
+            print(f"Warning: KLD loss computation failed: {e}")
+            return torch.tensor(100.0, device=device, requires_grad=True)
+
+    def _compute_iou_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, iou_type: str) -> torch.Tensor:
+        """Calcule la loss IoU du type spécifié."""
+        device = pred_boxes.device
+        try:
+            if iou_type == 'iou':
+                iou = self.oriented_iou(pred_boxes, target_boxes)
+                loss = 1.0 - iou
+            elif iou_type == 'giou':
+                iou, giou = self.oriented_giou(pred_boxes, target_boxes)
+                loss = 1.0 - giou
+            elif iou_type == 'diou':
+                iou, diou = self.oriented_diou(pred_boxes, target_boxes)
+                loss = 1.0 - diou
+            elif iou_type == 'ciou':
+                iou, ciou = self.oriented_ciou(pred_boxes, target_boxes)
+                loss = 1.0 - ciou
+            elif iou_type == 'siou':
+                iou, siou = self.oriented_siou(pred_boxes, target_boxes)
+                loss = 1.0 - siou
+            else:
+                raise ValueError(f"Type IoU '{iou_type}' non supporté")
+            
+            return loss.mean()
+        except Exception as e:
+            print(f"Warning: {iou_type.upper()} loss computation failed: {e}")
+            return torch.tensor(1.0, device=device, requires_grad=True)
+
+    def _compute_iou_metric(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+        """Calcule la métrique IoU (peut être avec ou sans gradients selon le contexte)."""
+        device = pred_boxes.device
+        
+        # Si KLD est la loss principale, calculer IoU comme métrique (sans gradients)
+        if self.loss_type == 'kld':
+            with torch.no_grad():
+                try:
+                    pred_xyxy = self._convert_cxcywha_to_xyxy(pred_boxes)
+                    target_xyxy = self._convert_cxcywha_to_xyxy(target_boxes)
+                    
+                    iou_matrix = ops.box_iou(pred_xyxy, target_xyxy)
+                    if iou_matrix.numel() > 0:
+                        return 1.0 - torch.diag(iou_matrix).mean()  # Retourne 1-IoU pour cohérence
+                    else:
+                        return torch.tensor(1.0, device=device)
+                except Exception as e:
+                    print(f"Warning: IoU metric computation failed: {e}")
+                    return torch.tensor(1.0, device=device)
+        else:
+            # Si IoU est la loss principale, elle sera calculée avec gradients dans _compute_iou_loss
+            # On retourne quand même une métrique IoU basique pour cohérence
+            with torch.no_grad():
+                try:
+                    iou = self.oriented_iou(pred_boxes, target_boxes)
+                    return 1.0 - iou.mean()
+                except Exception as e:
+                    print(f"Warning: IoU metric computation failed: {e}")
+                    return torch.tensor(1.0, device=device)
+
+    # ===== MÉTHODES IoU ORIENTÉES (depuis OrientedIoULoss) =====
+
+    def oriented_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+        """Version optimisée du calcul IoU orientée"""
+        poly1 = self.obb_to_polygon(boxes1)
+        poly2 = self.obb_to_polygon(boxes2)
+        
+        area1 = boxes1[:, 2] * boxes1[:, 3]
+        area2 = boxes2[:, 2] * boxes2[:, 3]
+        
+        intersection = self.compute_polygon_intersection_area(poly1, poly2)
+        union = area1 + area2 - intersection
+        
+        iou = intersection / (union + self.eps)
+        return torch.clamp(iou, 0.0, 1.0)
+
+    def oriented_giou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+        """Calcule le Generalized IoU (GIoU) orienté"""
+        iou = self.oriented_iou(boxes1, boxes2)
+        
+        poly1 = self.obb_to_polygon(boxes1)
+        poly2 = self.obb_to_polygon(boxes2)
+        
+        area1 = boxes1[:, 2] * boxes1[:, 3]
+        area2 = boxes2[:, 2] * boxes2[:, 3]
+        
+        min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+        max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+        enclosing_area = (max_xy[:, 0] - min_xy[:, 0]) * (max_xy[:, 1] - min_xy[:, 1])
+        union = area1 + area2 - self.compute_polygon_intersection_area(poly1, poly2)
+        
+        giou = iou - (enclosing_area - union) / (enclosing_area + self.eps)
+        return iou, torch.clamp(giou, min=-1.0, max=1.0)
+
+    def oriented_diou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+        """Calcule le Distance IoU (DIoU) orienté"""
+        iou = self.oriented_iou(boxes1, boxes2)
+        
+        centers1 = boxes1[:, :2]
+        centers2 = boxes2[:, :2]
+        d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+        poly1 = self.obb_to_polygon(boxes1)
+        poly2 = self.obb_to_polygon(boxes2)
+        
+        min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+        max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+        c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        diou = iou - d2 / (c2 + self.eps)
+        
+        return iou, torch.clamp(diou, min=-1.0, max=1.0)
+
+    def oriented_ciou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+        """Version corrigée du CIoU orienté avec stabilité numérique"""
+        iou = self.oriented_iou(boxes1, boxes2)
+        
+        centers1 = boxes1[:, :2]
+        centers2 = boxes2[:, :2]
+        d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+        poly1 = self.obb_to_polygon(boxes1)
+        poly2 = self.obb_to_polygon(boxes2)
+        
+        min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+        max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+        c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        distance_term = torch.clamp(d2 / (c2 + self.eps), min=0.0, max=1.0)
+        
+        w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+        w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+        # Calcul amélioré du terme d'aspect ratio
+        a1_norm = torch.atan2(torch.sin(2*a1), torch.cos(2*a1)) / 2
+        a2_norm = torch.atan2(torch.sin(2*a2), torch.cos(2*a2)) / 2
+        
+        ar1 = w1 / torch.clamp(h1, min=self.eps)
+        ar2 = w2 / torch.clamp(h2, min=self.eps)
+        
+        angle_diff = torch.abs(a1_norm - a2_norm)
+        should_flip = angle_diff > (math.pi / 4)
+        ar1_adjusted = torch.where(should_flip, 1.0 / ar1, ar1)
+        
+        atan_diff = torch.atan(ar2) - torch.atan(ar1_adjusted)
+        v = (4.0 / (math.pi ** 2)) * torch.pow(atan_diff, 2)
+        v = torch.clamp(v, min=0.0, max=1.0)
+        
+        denominator = (1.0 - iou + v + self.eps)
+        alpha = v / denominator
+        alpha = torch.clamp(alpha, min=0.0, max=1.0)
+        
+        aspect_weight = torch.sigmoid(2 * (0.5 - iou))
+        aspect_penalty = aspect_weight * alpha * v
+        aspect_penalty = torch.clamp(aspect_penalty, min=0.0, max=0.5)
+        
+        ciou = iou - distance_term - aspect_penalty
+        ciou = torch.clamp(ciou, min=-1.0, max=1.0)
+        
+        return iou, ciou
+
+    def oriented_siou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+        """Calcule le Scale-Invariant IoU (SIoU) orienté"""
+        iou = self.oriented_iou(boxes1, boxes2)
+        
+        centers1 = boxes1[:, :2]
+        centers2 = boxes2[:, :2]
+        d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+        poly1 = self.obb_to_polygon(boxes1)
+        poly2 = self.obb_to_polygon(boxes2)
+        
+        min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+        max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+        c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        distance_term = d2 / (c2 + self.eps)
+        
+        w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+        w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+        a1_normalized = torch.atan2(torch.sin(a1), torch.cos(a1))
+        a2_normalized = torch.atan2(torch.sin(a2), torch.cos(a2))
+        
+        # Terme d'aspect ratio
+        ar1 = w1 / (h1 + self.eps)
+        ar2 = w2 / (h2 + self.eps)
+        
+        angle_diff = torch.abs(a1_normalized - a2_normalized)
+        angle_adjustment = torch.abs(torch.sin(angle_diff))
+        
+        ar1_adjusted = ar1 * (1 - angle_adjustment) + (1 / ar1) * angle_adjustment
+        v = (4.0 / (math.pi ** 2)) * torch.pow(torch.atan(ar2) - torch.atan(ar1_adjusted), 2)
+        
+        # Terme d'échelle
+        area1 = w1 * h1
+        area2 = w2 * h2
+        scale_ratio = torch.maximum(area1 / (area2 + self.eps), area2 / (area1 + self.eps))
+        theta = 2 * torch.atan(torch.sqrt(scale_ratio) - 1)
+        scale_term = torch.pow(torch.sin(theta), 2)
+        
+        # Terme d'angle
+        angle_term = torch.pow(torch.sin(angle_diff / 2), 2)
+        
+        # Combinaison des termes
+        alpha = v / ((1 - iou) + v + self.eps)
+        quality_weight = torch.clamp(1.0 - iou, min=0.2, max=1.0)
+        
+        aspect_weight = 0.8 * quality_weight
+        scale_weight = 0.4 * quality_weight
+        angle_weight = 0.2 * quality_weight
+        
+        siou = iou - distance_term - aspect_weight * alpha * v - scale_weight * scale_term - angle_weight * angle_term
+        
+        return iou, torch.clamp(siou, min=-1.0, max=1.0)
+
+    def obb_to_polygon(self, boxes: torch.Tensor) -> torch.Tensor:
+        """Conversion OBB -> polygone optimisée"""
+        cx, cy, w, h, angle = boxes.unbind(-1)
+        
+        w_half, h_half = w / 2, h / 2
+        cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+        
+        corners_x = torch.stack([
+            -w_half * cos_a + h_half * sin_a + cx,
+            w_half * cos_a + h_half * sin_a + cx,
+            w_half * cos_a - h_half * sin_a + cx,
+            -w_half * cos_a - h_half * sin_a + cx
+        ], dim=1)
+        
+        corners_y = torch.stack([
+            -w_half * sin_a - h_half * cos_a + cy,
+            w_half * sin_a - h_half * cos_a + cy,
+            w_half * sin_a + h_half * cos_a + cy,
+            -w_half * sin_a + h_half * cos_a + cy
+        ], dim=1)
+        
+        return torch.stack([corners_x, corners_y], dim=-1)
+
+    def compute_polygon_intersection_area(self, poly1: torch.Tensor, poly2: torch.Tensor) -> torch.Tensor:
+        """Calcule l'aire d'intersection entre deux ensembles de polygones"""
+        device = poly1.device
+        batch_size = poly1.shape[0]
+        areas = torch.zeros(batch_size, device=device)
+        
+        for i in range(batch_size):
+            clipped_polygon = self.clip_polygon(poly1[i], poly2[i])
+            if clipped_polygon.shape[0] > 2:
+                areas[i] = self.compute_polygon_area(clipped_polygon)
+        
+        return areas
+
+    def clip_polygon(self, subject_polygon: torch.Tensor, clip_polygon: torch.Tensor) -> torch.Tensor:
+        """Algorithme de découpage Sutherland-Hodgman"""
+        device = subject_polygon.device
+        output_list = subject_polygon
+        
+        for i in range(clip_polygon.shape[0]):
+            clip_edge_start = clip_polygon[i]
+            clip_edge_end = clip_polygon[(i + 1) % clip_polygon.shape[0]]
+            
+            input_list = output_list
+            output_list = torch.zeros((0, 2), device=device)
+            
+            if input_list.shape[0] == 0:
+                continue
+                
+            s = input_list[-1]
+            for e in input_list:
+                if self.is_inside(e, clip_edge_start, clip_edge_end):
+                    if not self.is_inside(s, clip_edge_start, clip_edge_end):
+                        intersection = self.compute_intersection(s, e, clip_edge_start, clip_edge_end)
+                        output_list = torch.cat([output_list, intersection.unsqueeze(0)], dim=0)
+                    
+                    output_list = torch.cat([output_list, e.unsqueeze(0)], dim=0)
+                elif self.is_inside(s, clip_edge_start, clip_edge_end):
+                    intersection = self.compute_intersection(s, e, clip_edge_start, clip_edge_end)
+                    output_list = torch.cat([output_list, intersection.unsqueeze(0)], dim=0)
+                
+                s = e
+        
+        return output_list
+
+    def is_inside(self, point: torch.Tensor, edge_start: torch.Tensor, edge_end: torch.Tensor) -> bool:
+        """Détermine si un point est à l'intérieur par rapport à une arête"""
+        return ((edge_end[0] - edge_start[0]) * (point[1] - edge_start[1]) -
+                (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0])) > 0
+
+    def compute_intersection(self, s: torch.Tensor, e: torch.Tensor, 
+                           edge_start: torch.Tensor, edge_end: torch.Tensor) -> torch.Tensor:
+        """Calcule l'intersection entre deux segments"""
+        dc = torch.stack([s - e, edge_start - edge_end], dim=0)
+        n1 = s[0] * e[1] - s[1] * e[0]
+        n2 = edge_start[0] * edge_end[1] - edge_start[1] * edge_end[0] 
+        n3 = 1.0 / (dc[0, 0] * dc[1, 1] - dc[0, 1] * dc[1, 0] + self.eps)
+        
+        return torch.tensor([
+            (n1 * dc[1, 0] - n2 * dc[0, 0]) * n3,
+            (n1 * dc[1, 1] - n2 * dc[0, 1]) * n3
+        ], device=s.device)
+
+    def compute_polygon_area(self, polygon: torch.Tensor) -> torch.Tensor:
+        """Calcule l'aire d'un polygone avec la formule de Shoelace"""
+        x = polygon[:, 0]
+        y = polygon[:, 1]
+        
+        return torch.abs(
+            torch.sum(x * torch.roll(y, -1)) - torch.sum(y * torch.roll(x, -1))
+        ) * 0.5
+
+    # ===== MÉTHODES DE SUPPORT =====
+
+    def _update_monitoring_values(self, l1_loss: torch.Tensor, iou_loss: torch.Tensor,
+                                  kld_loss: torch.Tensor, weighted_loss: torch.Tensor):
+        """Met à jour les attributs de monitoring avec interface simplifiée"""
+        self._last_l1_loss = l1_loss.detach()
+        self._last_iou_loss = iou_loss.detach()
+        self._last_kld_loss = kld_loss.detach()
+        self._last_weighted_loss = weighted_loss.detach()
+
+    def _validate_shapes(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, valid_mask: torch.Tensor):
+        """Validation des dimensions des tenseurs"""
+        assert pred_boxes.shape == target_boxes.shape, \
+            f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+        assert pred_boxes.shape[:-1] == valid_mask.shape, \
+            f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
+
+    def _prepare_boxes_for_loss(self, boxes: torch.Tensor) -> torch.Tensor:
+        """Préparation et validation des boîtes"""
+        if boxes.dim() == 1:
+            boxes = boxes.unsqueeze(0)
+
+        processed_boxes = boxes.clone()
+
+        if self.coord_format == 'xyxy':
+            if processed_boxes.shape[-1] == 4:
+                angles = torch.zeros(processed_boxes.shape[0], 1, device=processed_boxes.device, dtype=processed_boxes.dtype)
+                processed_boxes = torch.cat([processed_boxes, angles], dim=-1)
+            processed_boxes = self._convert_xyxy_to_cxcywha(processed_boxes)
+        elif self.coord_format == 'cxcywha':
+            if processed_boxes.shape[-1] == 4:
+                angles = torch.zeros(processed_boxes.shape[0], 1, device=processed_boxes.device, dtype=processed_boxes.dtype)
+                processed_boxes = torch.cat([processed_boxes, angles], dim=-1)
+        else:
+            raise ValueError(f"Format {self.coord_format} non supporté")
+
+        cx, cy, w, h, angles = processed_boxes.unbind(-1)
+
+        cx_clamped = torch.clamp(cx, min=0.0, max=self.coord_max)
+        cy_clamped = torch.clamp(cy, min=0.0, max=self.coord_max)
+        w_fixed = torch.clamp(w, min=self.eps, max=self.coord_max)
+        h_fixed = torch.clamp(h, min=self.eps, max=self.coord_max)
+
+        if self.angle_normalization == 'symmetric_pi':
+            angles_normalized = self._normalize_angle_symmetric_pi(angles)
+        elif self.angle_normalization == 'positive_pi':
+            angles_normalized = self._normalize_angle_positive_pi(angles)
+        else:
+            angles_normalized = angles
+
+        return torch.stack([cx_clamped, cy_clamped, w_fixed, h_fixed, angles_normalized], dim=-1)
+
+    def _convert_xyxy_to_cxcywha(self, boxes_xyxy_angle: torch.Tensor) -> torch.Tensor:
+        """Conversion (xmin,ymin,xmax,ymax,angle) -> (cx,cy,w,h,angle)"""
+        xmin, ymin, xmax, ymax, angle = boxes_xyxy_angle.unbind(-1)
+
+        cx = (xmin + xmax) / 2
+        cy = (ymin + ymax) / 2
+        w = torch.abs(xmax - xmin)
+        h = torch.abs(ymax - ymin)
+
+        return torch.stack([cx, cy, w, h, angle], dim=1)
+
+    def _convert_cxcywha_to_xyxy(self, boxes_cxcywha: torch.Tensor) -> torch.Tensor:
+        """Conversion (cx,cy,w,h,angle) -> (xmin,ymin,xmax,ymax) pour IoU AABB"""
+        cx, cy, w, h, _ = boxes_cxcywha.unbind(-1)
+        xmin = cx - w / 2
+        ymin = cy - h / 2
+        xmax = cx + w / 2
+        ymax = cy + h / 2
+        return torch.stack([xmin, ymin, xmax, ymax], dim=-1)
+
+    def _normalize_angle_symmetric_pi(self, angles: torch.Tensor) -> torch.Tensor:
+        """Normalisation dans [-π/2, π/2]"""
+        angles_mod = angles % (2 * math.pi)
+        angles_wrapped = torch.where(angles_mod > math.pi, angles_mod - 2 * math.pi, angles_mod)
+        angles_sym1 = torch.where(angles_wrapped > math.pi / 2, angles_wrapped - math.pi, angles_wrapped)
+        angles_sym2 = torch.where(angles_sym1 < -math.pi / 2, angles_sym1 + math.pi, angles_sym1)
+        return angles_sym2
+
+    def _normalize_angle_positive_pi(self, angles: torch.Tensor) -> torch.Tensor:
+        """Normalisation dans [0, π]"""
+        return angles % math.pi
+
+    def _obb_to_gaussian_params(self, boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convertit les paramètres d'OBB en paramètres de Gaussienne 2D"""
+        cx, cy, w, h, angle = boxes.unbind(-1)
+
+        mu = torch.stack([cx, cy], dim=-1)
+
+        w_sq_4 = (w**2 / 4)
+        h_sq_4 = (h**2 / 4)
+
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+
+        R = torch.stack([
+            torch.stack([cos_a, -sin_a], dim=-1),
+            torch.stack([sin_a, cos_a], dim=-1)
+        ], dim=-2)
+
+        S = torch.diag_embed(torch.stack([w_sq_4, h_sq_4], dim=-1))
+        Sigma = torch.matmul(R, torch.matmul(S, R.transpose(-1, -2)))
+
+        return mu, Sigma
+
+    def get_loss_components(self):
+        """
+        Retourne les composants de perte pour le monitoring avec interface simplifiée.
+        Toujours 'iou_loss' et 'kld_loss' peu importe le type de loss principale.
+        """
+        if self._last_l1_loss is None:
+            device = next(self.parameters()).device if hasattr(self, 'parameters') and next(self.parameters(), None) is not None else torch.device('cpu')
+            zero = torch.tensor(0.0, device=device)
+            return {
+                'l1_loss': zero, 
+                'iou_loss': zero, 
+                'kld_loss': zero, 
+                'weighted_loss': zero
+            }
+
+        return {
+            'l1_loss': self._last_l1_loss,
+            'iou_loss': self._last_iou_loss,
+            'kld_loss': self._last_kld_loss,
+            'weighted_loss': self._last_weighted_loss
+        }
+
+    def get_loss_info(self):
+        """Retourne les informations sur la configuration de la loss"""
+        return {
+            'loss_type': self.loss_type,
+            'l1_weight': self.l1_weight,
+            'main_loss_weight': self.main_loss_weight,
+            'is_kld_main': self.loss_type == 'kld',
+            'is_iou_main': self.loss_type != 'kld'
+        }
+
+# import math
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+
+# class LocalisationLoss(nn.Module):
+#     """
+#     Loss combinée L1 + IoU orientée optimisée pour la détection de boîtes orientées.
+#     Utilise un calcul précis d'intersection de polygones pour les boîtes orientées.
+#     """
+    
+#     def __init__(self, 
+#                  l1_weight: float = 1.0,
+#                  iou_weight: float = 5.0,
+#                  iou_type: str = 'ciou',  # 'iou', 'giou', 'diou', 'ciou'
+#                  coord_format: str = 'cxcywha',  # 'xyxy', 'cxcywha'
+#                  angle_normalization: str = 'symmetric_pi',
+#                  eps: float = 1e-7):
+#         super().__init__()
+        
+#         self.l1_weight = l1_weight
+#         self.iou_weight = iou_weight
+#         self.coord_format = coord_format
+#         self.eps = eps
+#         self.l1_loss = torch.tensor(0)
+#         self.iou_loss = torch.tensor(0)
+        
+#         # Loss IoU orientée intégrée
+#         self.oriented_iou_loss = OrientedIoULoss(
+#             loss_type=iou_type,
+#             reduction='mean',
+#             eps=eps
+#         )
+        
+#         # Fonction de normalisation d'angle
+#         self.angle_normalization = angle_normalization
+    
+#     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             logits: (batch_size, seq_len, 4 ou 5) - prédictions des boîtes
+#             targets: (batch_size, seq_len, 4 ou 5) - boîtes cibles  
+#             mask: (batch_size, seq_len) - masque de validité
+#         """
+#         device = logits.device
+        
+#         # Préparation des données (décalage temporel)
+#         pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4/5)
+#         target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4/5)
+#         valid_mask = mask[:, 1:]  # (batch_size, seq_len-1)
+        
+#         # Normalisation des dimensions du masque
+#         if valid_mask.dim() == 3:
+#             valid_mask = valid_mask.squeeze(-1)
+        
+#         # Validation des dimensions
+#         self._validate_shapes(pred_boxes, target_boxes, valid_mask)
+        
+#         # Calcul du nombre d'éléments valides
+#         mask_sum = torch.sum(valid_mask)
+#         if mask_sum == 0:
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+        
+#         # Calcul des losses
+#         self.l1_loss = self._compute_l1_loss(pred_boxes, target_boxes, valid_mask, mask_sum)
+#         self.iou_loss = self._compute_iou_loss(pred_boxes, target_boxes, valid_mask)
+        
+        
+#         return self.l1_weight * self.l1_loss + self.iou_weight * self.iou_loss
+    
+#     def _validate_shapes(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, valid_mask: torch.Tensor):
+#         """Validation des dimensions des tenseurs"""
+#         assert pred_boxes.shape == target_boxes.shape, \
+#             f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+#         assert pred_boxes.shape[:-1] == valid_mask.shape, \
+#             f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
+    
+#     def _compute_l1_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                         valid_mask: torch.Tensor, mask_sum: torch.Tensor) -> torch.Tensor:
+#         """Calcul optimisé de la loss L1 avec masquage"""
+#         # Masquage vectorisé
+#         mask_expanded = valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 1)
+        
+#         # Calcul L1 seulement sur les éléments valides
+#         per_element_loss = F.smooth_l1_loss(pred_boxes, target_boxes, reduction="none")  # (B, S, 4/5)
+#         masked_loss = per_element_loss * mask_expanded
+        
+#         # Moyenne sur les éléments valides
+#         num_coords = pred_boxes.shape[-1]  # 4 ou 5 coordonnées
+#         return torch.sum(masked_loss) / (mask_sum * num_coords)
+    
+#     def _compute_iou_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                          valid_mask: torch.Tensor) -> torch.Tensor:
+#         """Calcul optimisé de la loss IoU orientée"""
+#         device = pred_boxes.device
+        
+#         # Filtrage efficace des éléments valides
+#         valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(1)
+        
+#         if len(valid_indices) == 0:
+#             return torch.tensor(1.0, device=device, requires_grad=True)
+        
+#         # Extraction des boîtes valides (vectorisé)
+#         flat_pred = pred_boxes.reshape(-1, pred_boxes.shape[-1])
+#         flat_target = target_boxes.reshape(-1, target_boxes.shape[-1])
+        
+#         valid_pred_boxes = flat_pred[valid_indices]
+#         valid_target_boxes = flat_target[valid_indices]
+        
+#         # Préparation des boîtes selon le format
+#         valid_pred_boxes = self._prepare_boxes(valid_pred_boxes)
+#         valid_target_boxes = self._prepare_boxes(valid_target_boxes)
+        
+#         # Calcul de la loss IoU orientée
+#         try:
+#             return self.oriented_iou_loss(valid_pred_boxes, valid_target_boxes)
+#         except Exception as e:
+#             print(f"Warning: Oriented IoU loss computation failed: {e}")
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     def _prepare_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Préparation et validation des boîtes selon le format"""
+#         if self.coord_format == 'xyxy':
+#             # Format (xmin, ymin, xmax, ymax) ou (xmin, ymin, xmax, ymax, angle)
+#             if boxes.shape[-1] == 4:
+#                 # Pas d'angle fourni - on assume angle = 0
+#                 angles = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, angles], dim=-1)
+#             elif boxes.shape[-1] == 5:
+#                 # Format (xmin, ymin, xmax, ymax, angle) - déjà avec angle
+#                 boxes_with_angle = boxes
+#             else:
+#                 raise ValueError(f"Format xyxy attendu avec 4 ou 5 dimensions, reçu {boxes.shape[-1]}")
+                
+#             # Conversion vers format cxcywha
+#             boxes_cxcywha = self._convert_xyxy_to_cxcywha(boxes_with_angle)
+#             return self._ensure_valid_oriented_boxes(boxes_cxcywha)
+            
+#         elif self.coord_format == 'cxcywha':
+#             # Format (cx, cy, w, h) ou (cx, cy, w, h, angle) - déjà compatible
+#             if boxes.shape[-1] == 4:
+#                 # Pas d'angle fourni - on assume angle = 0
+#                 angles = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, angles], dim=-1)
+#             elif boxes.shape[-1] == 5:
+#                 # Format (cx, cy, w, h, angle) - déjà complet
+#                 boxes_with_angle = boxes
+#             else:
+#                 raise ValueError(f"Format cxcywha attendu avec 4 ou 5 dimensions, reçu {boxes.shape[-1]}")
+                
+#             return self._ensure_valid_oriented_boxes(boxes_with_angle)
+#         else:
+#             raise ValueError(f"Format {self.coord_format} non supporté")
+
+#     def _convert_xyxy_to_cxcywha(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Conversion (xmin,ymin,xmax,ymax,angle) -> (cx,cy,w,h,angle)"""
+#         xmin, ymin, xmax, ymax = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+#         angle = boxes[:, 4] if boxes.shape[-1] == 5 else torch.zeros_like(xmin)
+        
+#         cx = (xmin + xmax) / 2
+#         cy = (ymin + ymax) / 2
+#         w = torch.abs(xmax - xmin)
+#         h = torch.abs(ymax - ymin)
+        
+#         return torch.stack([cx, cy, w, h, angle], dim=1)
+    
+#     def _ensure_valid_oriented_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Validation et correction des boîtes orientées - SANS opérations in-place"""
+#         # Clamp des coordonnées (sauf l'angle) - création nouveau tenseur
+#         coords_clamped = torch.clamp(boxes[:, :4], min=0.0)
+        
+#         # S'assurer que width et height sont positives - création nouveaux tenseurs
+#         w_fixed = torch.maximum(coords_clamped[:, 2], torch.full_like(coords_clamped[:, 2], self.eps))
+#         h_fixed = torch.maximum(coords_clamped[:, 3], torch.full_like(coords_clamped[:, 3], self.eps))
+        
+#         # Normalisation de l'angle - création nouveau tenseur
+#         if self.angle_normalization == 'symmetric_pi':
+#             angles_normalized = self._normalize_angle_symmetric_pi(boxes[:, 4])
+#         elif self.angle_normalization == 'positive_pi':
+#             angles_normalized = self._normalize_angle_positive_pi(boxes[:, 4])
+#         else:
+#             angles_normalized = boxes[:, 4]
+        
+#         # Reconstruction complète du tenseur - AUCUNE opération in-place
+#         boxes_fixed = torch.stack([
+#             coords_clamped[:, 0],  # cx
+#             coords_clamped[:, 1],  # cy
+#             w_fixed,               # w
+#             h_fixed,               # h
+#             angles_normalized      # angle
+#         ], dim=1)
+        
+#         return boxes_fixed
+    
+#     def _normalize_angle_symmetric_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [-π/2, π/2] - SANS opérations in-place"""
+#         # Normalisation de base dans [-π, π]
+#         angles_mod = angles % (2 * math.pi)
+#         angles_wrapped = torch.where(angles_mod > math.pi, angles_mod - 2 * math.pi, angles_mod)
+        
+#         # Normalisation dans [-π/2, π/2]
+#         angles_sym1 = torch.where(angles_wrapped > math.pi / 2, angles_wrapped - math.pi, angles_wrapped)
+#         angles_sym2 = torch.where(angles_sym1 < -math.pi / 2, angles_sym1 + math.pi, angles_sym1)
+        
+#         return angles_sym2
+    
+#     def _normalize_angle_positive_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [0, π] - SANS opérations in-place"""
+#         return angles % math.pi
+
+
+# class OrientedIoULoss(nn.Module):
+#     """
+#     Calcule la loss IoU orientée avec support pour différents types d'IoU:
+#     - IoU: Intersection over Union standard
+#     - GIoU: Generalized IoU (pénalise les boîtes éloignées)
+#     - DIoU: Distance IoU (considère la distance entre centres)
+#     - CIoU: Complete IoU (considère distance, taille et orientation)
+#     """
+    
+#     def __init__(self, loss_type: str = 'iou', reduction: str = 'mean', eps: float = 1e-7):
+#         super().__init__()
+#         self.loss_type = loss_type
+#         self.reduction = reduction
+#         self.eps = eps
+        
+#         if loss_type not in ['iou', 'giou', 'diou', 'ciou']:
+#             raise ValueError(f"Type de loss '{loss_type}' non supporté. "
+#                            f"Utilisez 'iou', 'giou', 'diou' ou 'ciou'.")
+    
+#     def forward(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             pred_boxes: (N, 5) [cx, cy, w, h, angle]
+#             target_boxes: (N, 5) [cx, cy, w, h, angle]
+#         """
+#         if self.loss_type == 'iou':
+#             iou = self.oriented_iou(pred_boxes, target_boxes)
+#             loss = 1.0 - iou
+#         elif self.loss_type == 'giou':
+#             iou, giou = self.oriented_giou(pred_boxes, target_boxes)
+#             loss = 1.0 - giou
+#         elif self.loss_type == 'diou':
+#             iou, diou = self.oriented_diou(pred_boxes, target_boxes)
+#             loss = 1.0 - diou
+#         elif self.loss_type == 'ciou':
+#             iou, ciou = self.oriented_ciou(pred_boxes, target_boxes)
+#             loss = 1.0 - ciou
+#         elif self.loss_type == 'siou':
+#             iou, siou = self.oriented_siou(pred_boxes, target_boxes)
+#             loss = 1.0 - siou
+#         else:
+#             raise ValueError(f"Type de loss '{self.loss_type}' non supporté.")
+        
+#         if self.reduction == 'mean':
+#             return loss.mean()
+#         elif self.reduction == 'sum':
+#             return loss.sum()
+#         else:
+#             return loss
+    
+#     def oriented_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Version optimisée du calcul IoU orientée avec CUDA"""
+#         # Conversion en polygones
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Aires des boîtes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+        
+#         # Calcul intersection précis
+#         intersection = self.compute_polygon_intersection_area(poly1, poly2)
+        
+#         # Union
+#         union = area1 + area2 - intersection
+        
+#         # IoU avec stabilité numérique
+#         iou = intersection / (union + self.eps)
+#         return torch.clamp(iou, 0.0, 1.0)
+    
+#     def oriented_giou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+#         """
+#         Calcule le Generalized IoU (GIoU) orienté entre deux ensembles de boîtes.
+#         GIoU = IoU - |C\(A∪B)|/|C|, où C est la plus petite boîte englobante.
+        
+#         Args:
+#             boxes1: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+#             boxes2: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+            
+#         Returns:
+#             tuple (iou, giou): IoU et GIoU entre les boîtes
+#         """
+#         # Calcule d'abord le IoU standard
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Conversion en polygones
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Aires des boîtes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+        
+#         # Calcul de la plus petite boîte englobant les deux polygones
+#         min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+#         max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+#         # Aire de la boîte englobante
+#         enclosing_area = (max_xy[:, 0] - min_xy[:, 0]) * (max_xy[:, 1] - min_xy[:, 1])
+        
+#         # Calcul de l'union
+#         union = area1 + area2 - self.compute_polygon_intersection_area(poly1, poly2)
+        
+#         # Calcul du GIoU
+#         giou = iou - (enclosing_area - union) / (enclosing_area + self.eps)
+        
+#         return iou, torch.clamp(giou, min=-1.0, max=1.0)
+    
+#     def oriented_diou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+#         """
+#         Calcule le Distance IoU (DIoU) orienté entre deux ensembles de boîtes.
+#         DIoU = IoU - d²/c², où d est la distance entre centres et c est la diagonale de la boîte englobante.
+        
+#         Args:
+#             boxes1: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+#             boxes2: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+            
+#         Returns:
+#             tuple (iou, diou): IoU et DIoU entre les boîtes
+#         """
+#         # Calcule d'abord le IoU standard
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Extraction des coordonnées des centres
+#         centers1 = boxes1[:, :2]  # [cx, cy]
+#         centers2 = boxes2[:, :2]  # [cx, cy]
+        
+#         # Distance euclidienne au carré entre les centres
+#         d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+#         # Conversion en polygones pour obtenir les points extrêmes
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Calcul de la plus petite boîte englobant les deux polygones
+#         min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+#         max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+#         # Diagonale au carré de la boîte englobante
+#         c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        
+#         # Calcul du DIoU
+#         diou = iou - d2 / (c2 + self.eps)
+        
+#         return iou, torch.clamp(diou, min=-1.0, max=1.0)
+
+#     def oriented_ciou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+#         """
+#         Version corrigée du CIoU orienté avec stabilité numérique améliorée
+#         """
+#         # Calcule d'abord le IoU standard
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Extraction des coordonnées des centres
+#         centers1 = boxes1[:, :2]  # [cx, cy]
+#         centers2 = boxes2[:, :2]  # [cx, cy]
+        
+#         # Distance euclidienne au carré entre les centres
+#         d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+#         # Conversion en polygones pour obtenir les points extrêmes
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Calcul de la plus petite boîte englobant les deux polygones
+#         min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+#         max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+#         # Diagonale au carré de la boîte englobante
+#         c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        
+#         # Term de distance (DIoU) - clampé pour éviter les valeurs négatives
+#         distance_term = torch.clamp(d2 / (c2 + self.eps), min=0.0, max=1.0)
+        
+#         # Extraction des dimensions et angles
+#         w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+#         w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+#         # === CALCUL AMÉLIORÉ DU TERME D'ASPECT RATIO ===
+        
+#         # Normalisation des angles entre -π/2 et π/2
+#         a1_norm = torch.atan2(torch.sin(2*a1), torch.cos(2*a1)) / 2
+#         a2_norm = torch.atan2(torch.sin(2*a2), torch.cos(2*a2)) / 2
+        
+#         # Calcul des ratios d'aspect avec protection contre division par zéro
+#         ar1 = w1 / torch.clamp(h1, min=self.eps)
+#         ar2 = w2 / torch.clamp(h2, min=self.eps)
+        
+#         # Gestion des orientations : si l'angle diffère de ~90°, on inverse le ratio
+#         angle_diff = torch.abs(a1_norm - a2_norm)
+#         should_flip = angle_diff > (math.pi / 4)
+#         ar1_adjusted = torch.where(should_flip, 1.0 / ar1, ar1)
+        
+#         # Calcul stable du terme v avec clipping
+#         atan_diff = torch.atan(ar2) - torch.atan(ar1_adjusted)
+#         v = (4.0 / (math.pi ** 2)) * torch.pow(atan_diff, 2)
+#         v = torch.clamp(v, min=0.0, max=1.0)  # Limitation de v
+        
+#         # Calcul d'alpha avec dénominateur stabilisé
+#         denominator = (1.0 - iou + v + self.eps)
+#         alpha = v / denominator
+#         alpha = torch.clamp(alpha, min=0.0, max=1.0)  # Limitation d'alpha
+        
+#         # === PONDÉRATION ADAPTATIVE ===
+        
+#         # Réduction de l'impact du terme d'aspect quand IoU est déjà bon
+#         # Utilisation d'une fonction plus douce
+#         aspect_weight = torch.sigmoid(2 * (0.5 - iou))  # [0, 1] avec transition douce
+        
+#         # Limitation globale du terme d'aspect
+#         aspect_penalty = aspect_weight * alpha * v
+#         aspect_penalty = torch.clamp(aspect_penalty, min=0.0, max=0.5)  # Max 0.5
+        
+#         # === CALCUL FINAL AVEC GARANTIES ===
+        
+#         # CIoU final avec clipping agressif
+#         ciou = iou - distance_term - aspect_penalty
+#         ciou = torch.clamp(ciou, min=-1.0, max=1.0)
+        
+#         # Debug optionnel
+#         if torch.any(torch.isnan(ciou)) or torch.any(ciou < -1.1):
+#             print(f"Warning: CIoU instable - IoU: {iou.mean():.3f}, "
+#                   f"distance: {distance_term.mean():.3f}, "
+#                   f"aspect: {aspect_penalty.mean():.3f}")
+        
+#         return iou, ciou
+
+#     def oriented_siou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+#         """
+#         Calcule le Scale-Invariant IoU (SIoU) orienté entre deux ensembles de boîtes.
+#         SIoU étend CIoU en ajoutant un terme de consistance d'échelle.
+        
+#         Args:
+#             boxes1: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+#             boxes2: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+            
+#         Returns:
+#             tuple (iou, siou): IoU et SIoU entre les boîtes
+#         """
+#         # Calcule d'abord le IoU standard
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Extraction des coordonnées des centres
+#         centers1 = boxes1[:, :2]  # [cx, cy]
+#         centers2 = boxes2[:, :2]  # [cx, cy]
+        
+#         # Distance euclidienne au carré entre les centres
+#         d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+#         # Conversion en polygones pour obtenir les points extrêmes
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Calcul de la plus petite boîte englobant les deux polygones
+#         min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+#         max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+#         # Diagonale au carré de la boîte englobante
+#         c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        
+#         # Term de distance (DIoU)
+#         distance_term = d2 / (c2 + self.eps)
+        
+#         # Extraction des dimensions et angles
+#         w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+#         w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+#         # Angles normalisés pour comparer des boîtes similaires
+#         a1_normalized = torch.atan2(torch.sin(a1), torch.cos(a1))
+#         a2_normalized = torch.atan2(torch.sin(a2), torch.cos(a2))
+        
+#         # ---------- 1. Terme d'aspect ratio (comme dans CIoU) ----------
+#         # Calcul des rapports d'aspect
+#         ar1 = w1 / (h1 + self.eps)
+#         ar2 = w2 / (h2 + self.eps)
+        
+#         # Correction d'angle: quand angle diffère d'environ 90°, inverser le ratio
+#         angle_diff = torch.abs(a1_normalized - a2_normalized)
+#         angle_adjustment = torch.abs(torch.sin(angle_diff))
+        
+#         # Ajustement dynamique du ratio d'aspect
+#         ar1_adjusted = ar1 * (1 - angle_adjustment) + (1 / ar1) * angle_adjustment
+        
+#         # Terme v: mesure de dissimilarité des ratios d'aspect
+#         v = (4.0 / (math.pi ** 2)) * torch.pow(
+#             torch.atan(ar2) - torch.atan(ar1_adjusted), 2)
+        
+#         # ---------- 2. Nouveau terme d'échelle ----------
+#         # Calcul des surfaces des boîtes
+#         area1 = w1 * h1
+#         area2 = w2 * h2
+        
+#         # Rapport d'échelle (toujours >= 1)
+#         scale_ratio = torch.maximum(area1 / (area2 + self.eps), area2 / (area1 + self.eps))
+        
+#         # Terme de pénalité d'échelle (mapping sigmoid pour contrôler l'impact)
+#         # Transformation logarithmique pour réduire l'effet des grandes différences
+#         theta = 2 * torch.atan(torch.sqrt(scale_ratio) - 1)  # Transforme [1, ∞) en [0, π/2)
+#         scale_term = torch.pow(torch.sin(theta), 2)  # [0, 1] avec croissance lente
+        
+#         # ---------- 3. Terme d'angle ----------
+#         # Pénalité pour différence d'angle (normalisée entre 0 et 1)
+#         # Utilisation de sin²(Δθ/2) pour une mesure symétrique et bornée
+#         angle_term = torch.pow(torch.sin(angle_diff / 2), 2)
+        
+#         # ---------- 4. Combinaison des termes ----------
+#         # Facteur alpha pour le terme d'aspect (comme dans CIoU)
+#         alpha = v / ((1 - iou) + v + self.eps)
+        
+#         # Balance entre les termes avec pondération adaptative
+#         # Réduit l'influence quand IoU est déjà élevé
+#         quality_weight = torch.clamp(1.0 - iou, min=0.2, max=1.0)
+        
+#         # Importance relative des termes: distance > aspect > échelle > angle
+#         aspect_weight = 0.8 * quality_weight
+#         scale_weight = 0.4 * quality_weight
+#         angle_weight = 0.2 * quality_weight
+        
+#         # Calcul final du SIoU
+#         siou = iou - distance_term - aspect_weight * alpha * v - scale_weight * scale_term - angle_weight * angle_term
+        
+#         return iou, torch.clamp(siou, min=-1.0, max=1.0)
+    
+
+    
+#     def obb_to_polygon(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Conversion OBB -> polygone optimisée - SANS opérations in-place
+        
+#         Args:
+#             boxes: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+            
+#         Returns:
+#             Tensor de forme (N, 4, 2) - polygones correspondants
+#         """
+#         cx, cy, w, h, angle = boxes.unbind(-1)
+        
+#         # Points locaux
+#         w_half, h_half = w / 2, h / 2
+        
+#         # Calcul trigonométrique optimisé
+#         cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+        
+#         # Matrice de rotation appliquée aux 4 coins - création nouveaux tenseurs
+#         corners_x = torch.stack([
+#             -w_half * cos_a + h_half * sin_a + cx,
+#             w_half * cos_a + h_half * sin_a + cx,
+#             w_half * cos_a - h_half * sin_a + cx,
+#             -w_half * cos_a - h_half * sin_a + cx
+#         ], dim=1)
+        
+#         corners_y = torch.stack([
+#             -w_half * sin_a - h_half * cos_a + cy,
+#             w_half * sin_a - h_half * cos_a + cy,
+#             w_half * sin_a + h_half * cos_a + cy,
+#             -w_half * sin_a + h_half * cos_a + cy
+#         ], dim=1)
+        
+#         return torch.stack([corners_x, corners_y], dim=-1)  # (N, 4, 2)
+    
+#     def compute_polygon_intersection_area(self, poly1: torch.Tensor, poly2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Calcule l'aire d'intersection entre deux ensembles de polygones avec CUDA.
+        
+#         Args:
+#             poly1: Tensor de forme (N, 4, 2) - polygones des boîtes prédites
+#             poly2: Tensor de forme (N, 4, 2) - polygones des boîtes cibles
+            
+#         Returns:
+#             Tensor de forme (N,) - aires d'intersection
+#         """
+#         device = poly1.device
+#         batch_size = poly1.shape[0]
+        
+#         # Préallocation des résultats
+#         areas = torch.zeros(batch_size, device=device)
+        
+#         # Traitement par lot pour optimisation CUDA
+#         for i in range(batch_size):
+#             # Découpage du polygone avec l'algorithme de Sutherland-Hodgman
+#             clipped_polygon = self.clip_polygon(poly1[i], poly2[i])
+            
+#             # Calcul de l'aire si un polygone d'intersection existe
+#             if clipped_polygon.shape[0] > 2:  # Au moins 3 points forment un polygone
+#                 areas[i] = self.compute_polygon_area(clipped_polygon)
+        
+#         return areas
+    
+#     def clip_polygon(self, subject_polygon: torch.Tensor, clip_polygon: torch.Tensor) -> torch.Tensor:
+#         """
+#         Implémentation PyTorch/CUDA de l'algorithme de découpage Sutherland-Hodgman.
+        
+#         Args:
+#             subject_polygon: Tensor de forme (4, 2) - polygone à découper
+#             clip_polygon: Tensor de forme (4, 2) - polygone de découpage
+            
+#         Returns:
+#             Tensor - polygone résultant du découpage
+#         """
+#         device = subject_polygon.device
+#         output_list = subject_polygon
+        
+#         # Pour chaque arête du polygone de découpage
+#         for i in range(clip_polygon.shape[0]):
+#             clip_edge_start = clip_polygon[i]
+#             clip_edge_end = clip_polygon[(i + 1) % clip_polygon.shape[0]]
+            
+#             input_list = output_list
+#             output_list = torch.zeros((0, 2), device=device)
+            
+#             # Pas de points à découper
+#             if input_list.shape[0] == 0:
+#                 continue
+                
+#             # Traitement de chaque arête du polygone sujet
+#             s = input_list[-1]
+#             for e in input_list:
+#                 # Point courant est à l'intérieur
+#                 if self.is_inside(e, clip_edge_start, clip_edge_end):
+#                     # Point précédent était à l'extérieur
+#                     if not self.is_inside(s, clip_edge_start, clip_edge_end):
+#                         # Ajouter le point d'intersection
+#                         intersection = self.compute_intersection(
+#                             s, e, clip_edge_start, clip_edge_end)
+#                         output_list = torch.cat([output_list, intersection.unsqueeze(0)], dim=0)
+                    
+#                     # Ajouter le point courant
+#                     output_list = torch.cat([output_list, e.unsqueeze(0)], dim=0)
+#                 # Point courant est à l'extérieur mais point précédent était à l'intérieur
+#                 elif self.is_inside(s, clip_edge_start, clip_edge_end):
+#                     # Ajouter le point d'intersection
+#                     intersection = self.compute_intersection(
+#                         s, e, clip_edge_start, clip_edge_end)
+#                     output_list = torch.cat([output_list, intersection.unsqueeze(0)], dim=0)
+                
+#                 # Mise à jour du point précédent
+#                 s = e
+        
+#         return output_list
+    
+#     def is_inside(self, point: torch.Tensor, edge_start: torch.Tensor, edge_end: torch.Tensor) -> bool:
+#         """
+#         Détermine si un point est à l'intérieur par rapport à une arête (à gauche de l'arête orientée).
+        
+#         Args:
+#             point: Tensor de forme (2,) - point à tester
+#             edge_start: Tensor de forme (2,) - début de l'arête
+#             edge_end: Tensor de forme (2,) - fin de l'arête
+            
+#         Returns:
+#             Boolean - True si le point est à l'intérieur
+#         """
+#         return ((edge_end[0] - edge_start[0]) * (point[1] - edge_start[1]) -
+#                 (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0])) > 0
+    
+#     def compute_intersection(self, s: torch.Tensor, e: torch.Tensor, 
+#                            edge_start: torch.Tensor, edge_end: torch.Tensor) -> torch.Tensor:
+#         """
+#         Calcule l'intersection entre deux segments avec optimisation CUDA.
+        
+#         Args:
+#             s: Tensor de forme (2,) - début du premier segment
+#             e: Tensor de forme (2,) - fin du premier segment
+#             edge_start: Tensor de forme (2,) - début du deuxième segment
+#             edge_end: Tensor de forme (2,) - fin du deuxième segment
+            
+#         Returns:
+#             Tensor de forme (2,) - point d'intersection
+#         """
+#         dc = torch.stack([s - e, edge_start - edge_end], dim=0)
+#         dp = torch.stack([s, edge_start], dim=0)
+#         n1 = s[0] * e[1] - s[1] * e[0]
+#         n2 = edge_start[0] * edge_end[1] - edge_start[1] * edge_end[0] 
+#         n3 = 1.0 / (dc[0, 0] * dc[1, 1] - dc[0, 1] * dc[1, 0] + self.eps)
+        
+#         return torch.tensor([
+#             (n1 * dc[1, 0] - n2 * dc[0, 0]) * n3,
+#             (n1 * dc[1, 1] - n2 * dc[0, 1]) * n3
+#         ], device=s.device)
+    
+#     def compute_polygon_area(self, polygon: torch.Tensor) -> torch.Tensor:
+#         """
+#         Calcule l'aire d'un polygone avec la formule de l'aire de Shoelace (formule du lacet).
+        
+#         Args:
+#             polygon: Tensor de forme (n, 2) - polygone dont on veut calculer l'aire
+            
+#         Returns:
+#             Tensor - aire du polygone
+#         """
+#         x = polygon[:, 0]
+#         y = polygon[:, 1]
+        
+#         # Formule de Shoelace optimisée pour PyTorch
+#         return torch.abs(
+#             torch.sum(x * torch.roll(y, -1)) - torch.sum(y * torch.roll(x, -1))
+#         ) * 0.5
+
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import math
+# from typing import Tuple, Optional
+
+
+# class OptimizedLocalisationLoss(nn.Module):
+#     """
+#     Version entièrement optimisée de LocalisationLoss avec monitoring des losses individuelles.
+#     Permet de récupérer l1_loss et iou_loss non pondérées pour le monitoring.
+#     """
+    
+#     def __init__(self, 
+#                  l1_weight: float = 10.0,
+#                  iou_weight: float = 2.0,
+#                  iou_type: str = 'iou',
+#                  coord_format: str = 'cxcywha',
+#                  angle_normalization: str = 'symmetric_pi',
+#                  eps: float = 1e-7,
+#                  grid_size: int = 32,
+#                  coord_max: float = 2.0):
+#         super().__init__()
+        
+#         self.l1_weight = l1_weight
+#         self.iou_weight = iou_weight
+#         self.coord_format = coord_format
+#         self.eps = eps
+#         self.grid_size = grid_size
+#         self.coord_max = coord_max
+        
+#         # Buffers pré-alloués pour optimisation GPU
+#         self.register_buffer('grid_x', torch.linspace(-1, 1, grid_size))
+#         self.register_buffer('grid_y', torch.linspace(-1, 1, grid_size))
+        
+#         # Loss IoU orientée optimisée
+#         self.oriented_iou_loss = OptimizedOrientedIoULoss(
+#             loss_type=iou_type,
+#             reduction='mean',
+#             eps=eps,
+#             grid_size=grid_size
+#         )
+        
+#         self.angle_normalization = angle_normalization
+        
+#         # Variables pour le monitoring - stockage des losses individuelles
+#         self._last_l1_loss = None
+#         self._last_iou_loss = None
+#         self._last_weighted_loss = None
+    
+#     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         """Version vectorisée complète du forward pass avec monitoring"""
+#         device = logits.device
+        
+#         # Préparation vectorisée des données
+#         pred_boxes = logits[:, :-1]
+#         target_boxes = targets[:, 1:]
+#         valid_mask = mask[:, 1:]
+        
+#         if valid_mask.dim() == 3:
+#             valid_mask = valid_mask.squeeze(-1)
+        
+#         # Validation rapide
+#         self._validate_shapes(pred_boxes, target_boxes, valid_mask)
+        
+#         # Calcul vectorisé du nombre d'éléments valides
+#         mask_sum = torch.sum(valid_mask)
+#         if mask_sum == 0:
+#             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+#             # Stockage pour monitoring même en cas de masque vide
+#             self._last_l1_loss = zero_loss.detach()
+#             self._last_iou_loss = zero_loss.detach()
+#             self._last_weighted_loss = zero_loss.detach()
+#             return zero_loss
+        
+#         # Calculs vectorisés parallèles avec indexation directe
+#         l1_loss_raw = self._compute_l1_loss_direct_indexing(pred_boxes, target_boxes, valid_mask, mask_sum)
+#         iou_loss_raw = self._compute_iou_loss_direct_indexing(pred_boxes, target_boxes, valid_mask)
+#         # Stockage des losses individuelles NON PONDÉRÉES pour monitoring
+#         self._last_l1_loss = l1_loss_raw.detach()
+#         self._last_iou_loss = iou_loss_raw.detach()
+        
+#         # Calcul de la loss finale pondérée
+#         weighted_loss = self.l1_weight * l1_loss_raw + self.iou_weight * iou_loss_raw
+#         self._last_weighted_loss = weighted_loss.detach()
+        
+#         return weighted_loss
+    
+#     def get_loss_components(self) -> Dict[str, torch.Tensor]:
+#         """
+#         Retourne les composantes individuelles de la loss pour le monitoring.
+        
+#         Returns:
+#             Dict contenant:
+#                 - 'l1_loss': Loss L1 non pondérée
+#                 - 'iou_loss': Loss IoU non pondérée  
+#                 - 'weighted_loss': Loss finale pondérée
+#                 - 'l1_weighted': Loss L1 pondérée (l1_loss * l1_weight)
+#                 - 'iou_weighted': Loss IoU pondérée (iou_loss * iou_weight)
+#         """
+#         if self._last_l1_loss is None or self._last_iou_loss is None:
+#             # Pas encore de forward pass effectué
+#             device = next(self.parameters()).device
+#             zero = torch.tensor(0.0, device=device)
+#             return {
+#                 'l1_loss': zero,
+#                 'iou_loss': zero,
+#                 'weighted_loss': zero,
+#                 'l1_weighted': zero,
+#                 'iou_weighted': zero
+#             }
+        
+#         return {
+#             'l1_loss': self._last_l1_loss,                                    # NON pondérée
+#             'iou_loss': self._last_iou_loss,                                  # NON pondérée
+#             'weighted_loss': self._last_weighted_loss,                        # Finale pondérée
+#             'l1_weighted': self._last_l1_loss * self.l1_weight,              # L1 pondérée
+#             'iou_weighted': self._last_iou_loss * self.iou_weight             # IoU pondérée
+#         }
+    
+#     def get_l1_loss(self) -> torch.Tensor:
+#         """Retourne la loss L1 NON pondérée du dernier forward pass"""
+#         return self._last_l1_loss if self._last_l1_loss is not None else torch.tensor(0.0)
+    
+#     def get_iou_loss(self) -> torch.Tensor:
+#         """Retourne la loss IoU NON pondérée du dernier forward pass"""
+#         return self._last_iou_loss if self._last_iou_loss is not None else torch.tensor(0.0)
+    
+#     def get_weighted_loss(self) -> torch.Tensor:
+#         """Retourne la loss finale pondérée du dernier forward pass"""
+#         return self._last_weighted_loss if self._last_weighted_loss is not None else torch.tensor(0.0)
+    
+#     def reset_monitoring(self):
+#         """Remet à zéro les variables de monitoring"""
+#         self._last_l1_loss = None
+#         self._last_iou_loss = None
+#         self._last_weighted_loss = None
+    
+#     def _validate_shapes(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, valid_mask: torch.Tensor):
+#         """Validation rapide des dimensions"""
+#         assert pred_boxes.shape == target_boxes.shape
+#         assert pred_boxes.shape[:-1] == valid_mask.shape
+    
+#     def _compute_l1_loss_direct_indexing(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                                        valid_mask: torch.Tensor, mask_sum: torch.Tensor) -> torch.Tensor:
+#         """Version ultra-optimisée du calcul L1 avec indexation directe"""
+#         # APPROCHE OPTIMALE: Masquage vectorisé direct sans reshape
+#         mask_expanded = valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 1)
+        
+#         # Calcul L1 vectorisé avec masquage direct
+#         loss_per_element = F.smooth_l1_loss(pred_boxes, target_boxes, reduction="none")
+#         masked_loss = loss_per_element * mask_expanded
+        
+#         # Somme vectorisée efficace
+#         num_coords = pred_boxes.shape[-1]
+#         return torch.sum(masked_loss) / (mask_sum * num_coords)
+    
+#     def _compute_iou_loss_direct_indexing(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                                         valid_mask: torch.Tensor) -> torch.Tensor:
+#         """Version entièrement optimisée avec indexation directe - AUCUN reshape/view"""
+#         device = pred_boxes.device
+        
+#         # APPROCHE OPTIMALE: Indexation directe sans reshape
+#         valid_positions = valid_mask.nonzero(as_tuple=False)  # (N_valid, 2)
+        
+#         if valid_positions.shape[0] == 0:
+#             return torch.tensor(1.0, device=device, requires_grad=True)
+        
+#         # Extraction directe avec indexation avancée - 0% overhead
+#         batch_indices, seq_indices = valid_positions.unbind(-1)
+#         valid_pred_boxes = pred_boxes[batch_indices, seq_indices]    # (N_valid, coord_dim)
+#         valid_target_boxes = target_boxes[batch_indices, seq_indices]  # (N_valid, coord_dim)
+        
+#         # Préparation vectorisée des boîtes
+#         valid_pred_prepared = self._prepare_boxes_direct_indexing(valid_pred_boxes)
+#         valid_target_prepared = self._prepare_boxes_direct_indexing(valid_target_boxes)
+        
+#         # Calcul IoU vectorisé
+#         try:
+#             return self.oriented_iou_loss(valid_pred_prepared, valid_target_prepared)
+#         except Exception as e:
+#             print(f"Warning: IoU vectorisé échoué: {e}")
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     def _prepare_boxes_direct_indexing(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Préparation vectorisée ultra-rapide des boîtes avec indexation directe"""
+#         if self.coord_format == 'xyxy':
+#             if boxes.shape[-1] == 4:
+#                 # Ajout vectorisé d'angles zéro - indexation directe
+#                 zeros = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, zeros], dim=-1)
+#             else:
+#                 boxes_with_angle = boxes
+            
+#             boxes_cxcywha = self._convert_xyxy_to_cxcywha_direct(boxes_with_angle)
+#             return self._ensure_valid_boxes_direct(boxes_cxcywha)
+            
+#         elif self.coord_format == 'cxcywha':
+#             if boxes.shape[-1] == 4:
+#                 zeros = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, zeros], dim=-1)
+#             else:
+#                 boxes_with_angle = boxes
+            
+#             return self._ensure_valid_boxes_direct(boxes_with_angle)
+#         else:
+#             raise ValueError(f"Format {self.coord_format} non supporté")
+    
+#     def _convert_xyxy_to_cxcywha_direct(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Conversion vectorisée ultra-rapide xyxy -> cxcywha avec indexation directe"""
+#         # Extraction directe par colonnes - plus efficace que unbind
+#         xmin, ymin, xmax, ymax, angle = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
+        
+#         # Calculs vectorisés purs
+#         cx = (xmin + xmax) * 0.5
+#         cy = (ymin + ymax) * 0.5
+#         w = torch.abs(xmax - xmin)
+#         h = torch.abs(ymax - ymin)
+        
+#         # Construction directe du tenseur résultat
+#         return torch.stack([cx, cy, w, h, angle], dim=-1)
+    
+#     def _ensure_valid_boxes_direct(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Validation adaptée aux coordonnées réelles"""
+#         cx, cy, w, h, angles = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
+        
+#         # Clamp dans la plage réelle de vos données [0, coord_max]
+#         cx_clamped = torch.clamp(cx, min=0.0, max=self.coord_max)
+#         cy_clamped = torch.clamp(cy, min=0.0, max=self.coord_max)
+#         w_fixed = torch.clamp(w, min=self.eps, max=self.coord_max)
+#         h_fixed = torch.clamp(h, min=self.eps, max=self.coord_max)
+        
+#         # Normalisation des angles
+#         angles_normalized = self._normalize_angles_direct(angles)
+        
+#         return torch.stack([cx_clamped, cy_clamped, w_fixed, h_fixed, angles_normalized], dim=-1)
+    
+#     def _normalize_angles_direct(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation vectorisée ultra-rapide des angles avec indexation directe"""
+#         if self.angle_normalization == 'symmetric_pi':
+#             # Normalisation vectorisée dans [-π/2, π/2] - version optimisée
+#             angles_mod = angles % (2 * math.pi)
+#             angles_wrapped = torch.where(angles_mod > math.pi, angles_mod - 2 * math.pi, angles_mod)
+#             angles_sym = torch.where(angles_wrapped > math.pi / 2, angles_wrapped - math.pi, angles_wrapped)
+#             return torch.where(angles_sym < -math.pi / 2, angles_sym + math.pi, angles_sym)
+#         elif self.angle_normalization == 'positive_pi':
+#             return angles % math.pi
+#         else:
+#             return angles
+
+# class OptimizedOrientedIoULoss(nn.Module):
+#     """
+#     Version ultra-optimisée de OrientedIoULoss avec indexation directe 
+#     et approximation vectorisée de l'intersection de polygones.
+#     """
+    
+#     def __init__(self, loss_type: str = 'iou', reduction: str = 'mean', 
+#                  eps: float = 1e-7, grid_size: int = 32):
+#         super().__init__()
+#         self.loss_type = loss_type
+#         self.reduction = reduction
+#         self.eps = eps
+#         self.grid_size = grid_size
+        
+#         # Pré-calcul de la grille d'échantillonnage
+#         self.register_buffer('sample_grid', self._create_sample_grid(grid_size))
+    
+#     def _create_sample_grid(self, grid_size: int) -> torch.Tensor:
+#         """Création d'une grille d'échantillonnage pour l'approximation d'intersection"""
+#         x = torch.linspace(-1.5, 1.5, grid_size)
+#         y = torch.linspace(-1.5, 1.5, grid_size)
+#         grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+#         return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=-1)  # (grid_size^2, 2)
+    
+#     def forward(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+#         """Forward pass ultra-optimisé avec indexation directe"""
+#         if self.loss_type == 'iou':
+#             iou = self.oriented_iou_direct_indexing(pred_boxes, target_boxes)
+#             loss = 1.0 - iou
+#         elif self.loss_type == 'giou':
+#             iou, giou = self.oriented_giou_direct_indexing(pred_boxes, target_boxes)
+#             loss = 1.0 - giou
+#         elif self.loss_type == 'diou':
+#             iou, diou = self.oriented_diou_direct_indexing(pred_boxes, target_boxes)
+#             loss = 1.0 - diou
+#         elif self.loss_type == 'ciou':
+#             iou, ciou = self.oriented_ciou_direct_indexing(pred_boxes, target_boxes)
+#             loss = 1.0 - ciou
+#         else:
+#             raise ValueError(f"Type de loss '{self.loss_type}' non supporté.")
+        
+#         if self.reduction == 'mean':
+#             return loss.mean()
+#         elif self.reduction == 'sum':
+#             return loss.sum()
+#         else:
+#             return loss
+    
+#     def oriented_iou_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Version ultra-rapide du calcul IoU avec indexation directe"""
+#         # Aires exactes des boîtes - indexation directe par colonnes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+        
+#         # Approximation rapide de l'intersection par échantillonnage
+#         intersection = self._fast_intersection_direct_indexing(boxes1, boxes2)
+        
+#         # IoU avec stabilité numérique
+#         union = area1 + area2 - intersection
+#         iou = intersection / (union + self.eps)
+#         return torch.clamp(iou, 0.0, 1.0)
+    
+#     def _fast_intersection_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Approximation ultra-rapide de l'intersection avec indexation directe.
+#         Aucun view/reshape/expand - uniquement des opérations vectorisées pures.
+#         """
+#         batch_size = boxes1.shape[0]
+#         device = boxes1.device
+#         n_samples = self.sample_grid.shape[0]
+        
+#         # OPTIMISATION: Expansion directe sans view/reshape problématique
+#         grid = self.sample_grid.to(device)  # (N_samples, 2)
+        
+#         # Création de la grille étendue via broadcasting direct
+#         # Évite complètement expand() qui peut causer des problèmes de contiguïté
+#         grid_broadcast = grid.unsqueeze(0)  # (1, N_samples, 2)
+#         # Le broadcasting automatique de PyTorch gère l'extension à (B, N_samples, 2)
+        
+#         # Test d'inclusion vectorisé avec indexation directe
+#         inside1 = self._point_in_oriented_box_direct_indexing(grid_broadcast, boxes1)  # (B, N_samples)
+#         inside2 = self._point_in_oriented_box_direct_indexing(grid_broadcast, boxes2)  # (B, N_samples)
+        
+#         # Intersection = points dans les deux boîtes
+#         intersection_points = inside1 & inside2  # (B, N_samples)
+        
+#         # Estimation de l'aire par comptage de points - calcul vectorisé pur
+#         grid_area = 9.0
+#         sample_density = self.grid_size * self.grid_size
+#         intersection_counts = intersection_points.float().sum(dim=1)  # (B,)
+        
+#         return intersection_counts * (grid_area / sample_density)
+    
+#     def _point_in_oriented_box_direct_indexing(self, points: torch.Tensor, boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Test vectorisé ultra-rapide avec indexation directe pure.
+        
+#         Args:
+#             points: (1, N_points, 2) ou (B, N_points, 2) - points à tester
+#             boxes: (B, 5) - boîtes [cx, cy, w, h, angle]
+        
+#         Returns:
+#             (B, N_points) - masque booléen d'inclusion
+#         """
+#         # Gestion du broadcasting automatique
+#         if points.dim() == 3 and points.shape[0] == 1:
+#             # Broadcasting automatique de (1, N_points, 2) vers (B, N_points, 2)
+#             points_x = points[0, :, 0]  # (N_points,)
+#             points_y = points[0, :, 1]  # (N_points,)
+#         else:
+#             points_x = points[:, :, 0]  # (B, N_points)
+#             points_y = points[:, :, 1]  # (B, N_points)
+        
+#         # Extraction directe des paramètres des boîtes par colonnes
+#         cx = boxes[:, 0]  # (B,)
+#         cy = boxes[:, 1]  # (B,)
+#         w = boxes[:, 2]   # (B,)
+#         h = boxes[:, 3]   # (B,)
+#         angle = boxes[:, 4]  # (B,)
+        
+#         # Broadcasting direct sans expand explicite - PyTorch gère automatiquement
+#         if points.dim() == 3 and points.shape[0] == 1:
+#             # Translation avec broadcasting automatique
+#             dx = points_x.unsqueeze(0) - cx.unsqueeze(1)  # (B, N_points)
+#             dy = points_y.unsqueeze(0) - cy.unsqueeze(1)  # (B, N_points)
+#         else:
+#             dx = points_x - cx.unsqueeze(1)  # (B, N_points)
+#             dy = points_y - cy.unsqueeze(1)  # (B, N_points)
+        
+#         # Trigonométrie vectorisée avec broadcasting automatique
+#         cos_angle = torch.cos(-angle).unsqueeze(1)  # (B, 1)
+#         sin_angle = torch.sin(-angle).unsqueeze(1)  # (B, 1)
+        
+#         # Rotation vectorisée - broadcasting automatique
+#         x_rot = dx * cos_angle - dy * sin_angle  # (B, N_points)
+#         y_rot = dx * sin_angle + dy * cos_angle  # (B, N_points)
+        
+#         # Test d'inclusion dans la boîte alignée - broadcasting automatique
+#         half_w = (w * 0.5).unsqueeze(1)  # (B, 1)
+#         half_h = (h * 0.5).unsqueeze(1)  # (B, 1)
+        
+#         inside_x = torch.abs(x_rot) <= half_w  # (B, N_points)
+#         inside_y = torch.abs(y_rot) <= half_h  # (B, N_points)
+        
+#         return inside_x & inside_y  # (B, N_points)
+    
+#     def oriented_giou_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """Version vectorisée du GIoU orienté avec indexation directe"""
+#         # IoU de base
+#         iou = self.oriented_iou_direct_indexing(boxes1, boxes2)
+        
+#         # Calcul vectorisé des boîtes englobantes avec indexation directe
+#         enclosing_area = self._compute_enclosing_area_direct_indexing(boxes1, boxes2)
+        
+#         # Aires et intersection - indexation directe par colonnes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+#         intersection = self._fast_intersection_direct_indexing(boxes1, boxes2)
+#         union = area1 + area2 - intersection
+        
+#         # GIoU
+#         giou = iou - (enclosing_area - union) / (enclosing_area + self.eps)
+#         return iou, torch.clamp(giou, min=-1.0, max=1.0)
+    
+#     def _compute_enclosing_area_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Calcul vectorisé ultra-rapide de l'aire englobante avec indexation directe"""
+#         # Conversion en polygones pour obtenir les extrema
+#         poly1 = self._obb_to_polygon_direct_indexing(boxes1)
+#         poly2 = self._obb_to_polygon_direct_indexing(boxes2)
+        
+#         # Calcul des boîtes englobantes - indexation directe
+#         min1 = torch.min(poly1, dim=1)[0]  # (B, 2)
+#         max1 = torch.max(poly1, dim=1)[0]  # (B, 2)
+#         min2 = torch.min(poly2, dim=1)[0]  # (B, 2)
+#         max2 = torch.max(poly2, dim=1)[0]  # (B, 2)
+        
+#         # Boîte englobante globale - indexation directe
+#         min_x = torch.min(min1[:, 0], min2[:, 0])  # (B,)
+#         min_y = torch.min(min1[:, 1], min2[:, 1])  # (B,)
+#         max_x = torch.max(max1[:, 0], max2[:, 0])  # (B,)
+#         max_y = torch.max(max1[:, 1], max2[:, 1])  # (B,)
+        
+#         # Aire englobante
+#         return (max_x - min_x) * (max_y - min_y)  # (B,)
+    
+#     def _obb_to_polygon_direct_indexing(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Conversion ultra-rapide OBB -> polygone avec indexation directe"""
+#         # Extraction directe par colonnes - plus efficace que unbind
+#         cx, cy, w, h, angle = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
+        
+#         # Demi-dimensions
+#         w_half = w * 0.5
+#         h_half = h * 0.5
+        
+#         # Trigonométrie vectorisée optimisée
+#         cos_a = torch.cos(angle)
+#         sin_a = torch.sin(angle)
+        
+#         # Calcul vectorisé des 4 coins avec indexation directe
+#         # Construction directe des coordonnées sans stack intermédiaire
+#         corner1_x = cx + (-w_half * cos_a + h_half * sin_a)
+#         corner1_y = cy + (-w_half * sin_a - h_half * cos_a)
+#         corner2_x = cx + (w_half * cos_a + h_half * sin_a)
+#         corner2_y = cy + (w_half * sin_a - h_half * cos_a)
+#         corner3_x = cx + (w_half * cos_a - h_half * sin_a)
+#         corner3_y = cy + (w_half * sin_a + h_half * cos_a)
+#         corner4_x = cx + (-w_half * cos_a - h_half * sin_a)
+#         corner4_y = cy + (-w_half * sin_a + h_half * cos_a)
+        
+#         # Construction finale du polygone - indexation directe optimisée
+#         corners_x = torch.stack([corner1_x, corner2_x, corner3_x, corner4_x], dim=1)  # (B, 4)
+#         corners_y = torch.stack([corner1_y, corner2_y, corner3_y, corner4_y], dim=1)  # (B, 4)
+        
+#         return torch.stack([corners_x, corners_y], dim=-1)  # (B, 4, 2)
+    
+#     def oriented_diou_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """Version vectorisée ultra-rapide du DIoU avec indexation directe"""
+#         # IoU de base
+#         iou = self.oriented_iou_direct_indexing(boxes1, boxes2)
+        
+#         # Distance entre centres - indexation directe par colonnes
+#         centers1_x, centers1_y = boxes1[:, 0], boxes1[:, 1]
+#         centers2_x, centers2_y = boxes2[:, 0], boxes2[:, 1]
+#         d2 = (centers1_x - centers2_x) ** 2 + (centers1_y - centers2_y) ** 2
+        
+#         # Diagonale de la boîte englobante
+#         enclosing_diagonal2 = self._compute_enclosing_diagonal2_direct_indexing(boxes1, boxes2)
+        
+#         # DIoU
+#         diou = iou - d2 / (enclosing_diagonal2 + self.eps)
+#         return iou, torch.clamp(diou, min=-1.0, max=1.0)
+    
+#     def _compute_enclosing_diagonal2_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Calcul vectorisé de la diagonale au carré avec indexation directe"""
+#         poly1 = self._obb_to_polygon_direct_indexing(boxes1)
+#         poly2 = self._obb_to_polygon_direct_indexing(boxes2)
+        
+#         # Extrema avec indexation directe
+#         min1 = torch.min(poly1, dim=1)[0]  # (B, 2)
+#         max1 = torch.max(poly1, dim=1)[0]  # (B, 2)
+#         min2 = torch.min(poly2, dim=1)[0]  # (B, 2)
+#         max2 = torch.max(poly2, dim=1)[0]  # (B, 2)
+        
+#         # Calcul direct de la diagonale - indexation par colonnes
+#         min_x = torch.min(min1[:, 0], min2[:, 0])
+#         min_y = torch.min(min1[:, 1], min2[:, 1])
+#         max_x = torch.max(max1[:, 0], max2[:, 0])
+#         max_y = torch.max(max1[:, 1], max2[:, 1])
+        
+#         # Diagonale au carré
+#         return (max_x - min_x) ** 2 + (max_y - min_y) ** 2
+    
+#     def oriented_ciou_direct_indexing(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+#         """Version vectorisée stabilisée du CIoU avec indexation directe"""
+#         # DIoU de base
+#         iou, diou = self.oriented_diou_direct_indexing(boxes1, boxes2)
+        
+#         # Extraction directe des paramètres par colonnes
+#         w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+#         w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+#         # Normalisation vectorisée des angles
+#         a1_norm = torch.atan2(torch.sin(2*a1), torch.cos(2*a1)) / 2
+#         a2_norm = torch.atan2(torch.sin(2*a2), torch.cos(2*a2)) / 2
+        
+#         # Ratios d'aspect avec stabilité
+#         ar1 = w1 / torch.clamp(h1, min=self.eps)
+#         ar2 = w2 / torch.clamp(h2, min=self.eps)
+        
+#         # Gestion vectorisée des orientations
+#         angle_diff = torch.abs(a1_norm - a2_norm)
+#         should_flip = angle_diff > (math.pi / 4)
+#         ar1_adjusted = torch.where(should_flip, 1.0 / ar1, ar1)
+        
+#         # Terme v stabilisé
+#         atan_diff = torch.atan(ar2) - torch.atan(ar1_adjusted)
+#         v = (4.0 / (math.pi ** 2)) * torch.pow(atan_diff, 2)
+#         v = torch.clamp(v, min=0.0, max=1.0)
+        
+#         # Alpha avec stabilité
+#         alpha = v / ((1.0 - iou) + v + self.eps)
+#         alpha = torch.clamp(alpha, min=0.0, max=1.0)
+        
+#         # Pondération adaptative
+#         aspect_weight = torch.clamp(1.0 - iou, min=0.2, max=1.0)
+#         aspect_penalty = aspect_weight * alpha * v * 0.5
+        
+#         # CIoU final
+#         ciou = diou - aspect_penalty
+#         return iou, torch.clamp(ciou, min=-1.0, max=1.0)
+
+
+# class HybridLocalisationLoss(nn.Module):
+#     """
+#     Version hybride : exactitude de la non-optimisée + optimisations ciblées
+#     """
+    
+#     def __init__(self, 
+#                  l1_weight: float = 1.0,
+#                  iou_weight: float = 5.0,
+#                  iou_type: str = 'ciou',
+#                  coord_format: str = 'cxcywha',
+#                  eps: float = 1e-7,
+#                  coord_max: float = 2.0):
+#         super().__init__()
+        
+#         self.l1_weight = l1_weight
+#         self.iou_weight = iou_weight
+#         self.coord_format = coord_format
+#         self.eps = eps
+#         self.coord_max = coord_max
+        
+#         # Utiliser la version NON-optimisée pour la précision
+#         self.oriented_iou_loss = OrientedIoULoss(
+#             loss_type=iou_type,
+#             reduction='mean',
+#             eps=eps
+#         )
+        
+#         # Storage pour monitoring
+#         self._last_l1_loss = None
+#         self._last_iou_loss = None
+#         self._last_weighted_loss = None
+    
+#     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         device = logits.device
+        
+#         # Préparation optimisée (gardez cette partie)
+#         pred_boxes = logits[:, :-1]
+#         target_boxes = targets[:, 1:]
+#         valid_mask = mask[:, 1:]
+        
+#         if valid_mask.dim() == 3:
+#             valid_mask = valid_mask.squeeze(-1)
+        
+#         mask_sum = torch.sum(valid_mask)
+#         if mask_sum == 0:
+#             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+#             self._last_l1_loss = zero_loss.detach()
+#             self._last_iou_loss = zero_loss.detach()
+#             self._last_weighted_loss = zero_loss.detach()
+#             return zero_loss
+        
+#         # L1 Loss optimisée (gardez cette version)
+#         l1_loss_raw = self._compute_l1_loss_vectorized(pred_boxes, target_boxes, valid_mask, mask_sum)
+        
+#         # IoU Loss EXACTE (utilisez la version non-optimisée)
+#         iou_loss_raw = self._compute_iou_loss_exact(pred_boxes, target_boxes, valid_mask)
+        
+#         # Storage et return
+#         self._last_l1_loss = l1_loss_raw.detach()
+#         self._last_iou_loss = iou_loss_raw.detach()
+        
+#         weighted_loss = self.l1_weight * l1_loss_raw + self.iou_weight * iou_loss_raw
+#         self._last_weighted_loss = weighted_loss.detach()
+        
+#         return weighted_loss
+    
+#     def _compute_l1_loss_vectorized(self, pred_boxes, target_boxes, valid_mask, mask_sum):
+#         """Gardez la version vectorisée pour L1 - elle est correcte"""
+#         mask_expanded = valid_mask.unsqueeze(-1)
+#         per_element_loss = F.smooth_l1_loss(pred_boxes, target_boxes, reduction="none")
+#         masked_loss = per_element_loss * mask_expanded
+#         return torch.sum(masked_loss) / (mask_sum * pred_boxes.shape[-1])
+    
+#     def _compute_iou_loss_exact(self, pred_boxes, target_boxes, valid_mask):
+#         """Utilise la version EXACTE pour IoU"""
+#         device = pred_boxes.device
+        
+#         # Filtrage des éléments valides (gardez cette optimisation)
+#         valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(1)
+        
+#         if len(valid_indices) == 0:
+#             return torch.tensor(1.0, device=device, requires_grad=True)
+        
+#         # Extraction vectorisée (gardez cette optimisation)
+#         flat_pred = pred_boxes.reshape(-1, pred_boxes.shape[-1])
+#         flat_target = target_boxes.reshape(-1, target_boxes.shape[-1])
+        
+#         valid_pred_boxes = flat_pred[valid_indices]
+#         valid_target_boxes = flat_target[valid_indices]
+        
+#         # Préparation (gardez la version optimisée)
+#         valid_pred_boxes = self._prepare_boxes_hybrid(valid_pred_boxes)
+#         valid_target_boxes = self._prepare_boxes_hybrid(valid_target_boxes)
+        
+#         # MAIS utilisez la version EXACTE pour le calcul IoU
+#         try:
+#             return self.oriented_iou_loss(valid_pred_boxes, valid_target_boxes)
+#         except Exception as e:
+#             print(f"Warning: Exact IoU computation failed: {e}")
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     def _prepare_boxes_hybrid(self, boxes):
+#         """Version optimisée de la préparation"""
+#         if self.coord_format == 'cxcywha':
+#             if boxes.shape[-1] == 4:
+#                 zeros = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, zeros], dim=-1)
+#             else:
+#                 boxes_with_angle = boxes
+            
+#             return self._ensure_valid_boxes_hybrid(boxes_with_angle)
+#         else:
+#             raise ValueError(f"Format {self.coord_format} non supporté")
+    
+#     def _ensure_valid_boxes_hybrid(self, boxes):
+#         """Validation optimisée"""
+#         cx, cy, w, h, angles = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3], boxes[:, 4]
+        
+#         cx_clamped = torch.clamp(cx, min=0.0, max=self.coord_max)
+#         cy_clamped = torch.clamp(cy, min=0.0, max=self.coord_max)
+#         w_fixed = torch.clamp(w, min=self.eps, max=self.coord_max)
+#         h_fixed = torch.clamp(h, min=self.eps, max=self.coord_max)
+        
+#         # Normalisation d'angle simple et efficace
+#         angles_normalized = torch.atan2(torch.sin(angles), torch.cos(angles))
+        
+#         return torch.stack([cx_clamped, cy_clamped, w_fixed, h_fixed, angles_normalized], dim=-1)
+    
+#     # Ajoutez les méthodes de monitoring de la version optimisée
+#     def get_loss_components(self):
+#         if self._last_l1_loss is None or self._last_iou_loss is None:
+#             device = next(self.parameters()).device
+#             zero = torch.tensor(0.0, device=device)
+#             return {'l1_loss': zero, 'iou_loss': zero, 'weighted_loss': zero}
+        
+#         return {
+#             'l1_loss': self._last_l1_loss,
+#             'iou_loss': self._last_iou_loss,
+#             'weighted_loss': self._last_weighted_loss
+#         }
+
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+# import math
+# import torchvision.ops as ops # Pour box_iou
+
+# # --- Classe KLDLossGaussian ( inchangée, elle est générique et robuste ) ---
+# class KLDLossGaussian(nn.Module):
+#     """
+#     Calcule la Kullback-Leibler Divergence (KLD) entre deux distributions Gaussiennes 2D.
+#     Utilisée pour la régression des boîtes englobantes orientées (OBB).
+#     """
+
+#     def __init__(self, eps: float = 1e-7):
+#         super().__init__()
+#         self.eps = eps
+
+#     def forward(self, mu1: torch.Tensor, sigma1: torch.Tensor, mu2: torch.Tensor, sigma2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             mu1 (torch.Tensor): Moyennes des Gaussiennes prédites (N, 2) [cx, cy]
+#             sigma1 (torch.Tensor): Matrices de covariance des Gaussiennes prédites (N, 2, 2)
+#             mu2 (torch.Tensor): Moyennes des Gaussiennes cibles (N, 2) [cx, cy]
+#             sigma2 (torch.Tensor): Matrices de covariance des Gaussiennes cibles (N, 2, 2)
+
+#         Returns:
+#             torch.Tensor: KLD Loss moyenne sur le lot.
+#         """
+#         # Assurer que les matrices de covariance sont inversibles et ont des déterminants positifs
+#         # Ajout d'une petite identité pour la stabilité numérique
+#         sigma1 = sigma1 + self.eps * torch.eye(2, device=sigma1.device).unsqueeze(0)
+#         sigma2 = sigma2 + self.eps * torch.eye(2, device=sigma2.device).unsqueeze(0)
+
+#         # Calcul des inverses et déterminants
+#         inv_sigma2 = torch.linalg.inv(sigma2)
+#         det_sigma1 = torch.linalg.det(sigma1)
+#         det_sigma2 = torch.linalg.det(sigma2)
+
+#         # Terme de trace
+#         trace_term = torch.diagonal(torch.matmul(inv_sigma2, sigma1), dim1=-2, dim2=-1).sum(-1)
+
+#         # Terme de différence des moyennes
+#         mu_diff = mu2 - mu1 # (N, 2)
+#         mu_diff_term = torch.matmul(mu_diff.unsqueeze(1), torch.matmul(inv_sigma2, mu_diff.unsqueeze(2))).squeeze(-1).squeeze(-1) # (N,)
+
+#         # Terme de déterminant
+#         det_term = torch.log(det_sigma2 / (det_sigma1 + self.eps)) # Ajouter eps pour stabilité
+
+#         # KLD Loss
+#         # Formule D_KL(P || Q) = 0.5 * (tr(Sigma2^-1 Sigma1) + (mu2 - mu1)^T Sigma2^-1 (mu2 - mu1) - k + ln(det(Sigma2)/det(Sigma1)))
+#         # k est la dimension, ici 2 pour 2D
+#         kld_loss_per_box = 0.5 * (trace_term + mu_diff_term - 2 + det_term)
+
+#         # Assurer que la KLD Loss est non-négative (elle doit l'être théoriquement)
+#         return torch.relu(kld_loss_per_box).mean()
+
+
+# # --- Nouvelle classe de Loss : KLDHybridLocalizationLoss ---
+# class KLDHybridLocalizationLoss(nn.Module):
+#     """
+#     Loss combinée pour la localisation :
+#     - KLD Loss pour la régression des boîtes orientées (gradients)
+#     - Smooth L1 Loss pour les coordonnées brutes (gradients)
+#     - IoU non-orientée (AABB) pour le monitoring (sans gradients)
+#     """
+
+#     def __init__(self,
+#                  l1_weight: float = 1.0,
+#                  kld_weight: float = 5.0,
+#                  coord_format: str = 'cxcywha',  # 'cxcywha' ou 'xyxy'
+#                  angle_normalization: str = 'symmetric_pi', # ou 'positive_pi' ou None
+#                  eps: float = 1e-7,
+#                  coord_max: float = 1.0): # Valeur max attendue pour les coordonnées normalisées (e.g., 1.0 pour [0,1])
+#         super().__init__()
+
+#         self.l1_weight = l1_weight
+#         self.kld_weight = kld_weight
+#         self.coord_format = coord_format
+#         self.angle_normalization = angle_normalization
+#         self.eps = eps
+#         self.coord_max = coord_max
+
+#         # KLD Loss calculator
+#         self.kld_calculator = KLDLossGaussian(eps=eps)
+
+#         # Storage pour monitoring des composants
+#         self._last_l1_loss = None
+#         self._last_kld_loss = None
+#         self._last_weighted_loss = None
+#         self._last_mean_iou_metric = None # Pour l'IoU AABB de monitoring
+
+#     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         device = logits.device
+
+#         # Préparation des données (décalage temporel)
+#         # Supposons que la dernière prédiction/cible n'est pas pour la localisation
+#         pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4/5)
+#         target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4/5)
+#         valid_mask = mask[:, 1:]  # (batch_size, seq_len-1)
+
+#         # Normalisation des dimensions du masque
+#         if valid_mask.dim() == 3:
+#             valid_mask = valid_mask.squeeze(-1)
+
+#         # Validation des dimensions
+#         self._validate_shapes(pred_boxes, target_boxes, valid_mask)
+
+#         # Calcul du nombre d'éléments valides
+#         mask_sum = torch.sum(valid_mask)
+#         if mask_sum == 0:
+#             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+#             self._update_monitoring_values(zero_loss, zero_loss, zero_loss, torch.tensor(1.0, device=device))
+#             return zero_loss
+
+#         # Filtrage efficace des éléments valides (pour L1, KLD et IoU)
+#         valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(1)
+#         flat_pred = pred_boxes.reshape(-1, pred_boxes.shape[-1])
+#         flat_target = target_boxes.reshape(-1, target_boxes.shape[-1])
+#         valid_pred_boxes = flat_pred[valid_indices]
+#         valid_target_boxes = flat_target[valid_indices]
+
+#         # --- Calcul de la Smooth L1 Loss ---
+#         # Pas besoin d'appliquer de _prepare_boxes_for_loss ici, SmoothL1 fonctionne sur les valeurs brutes
+#         l1_loss = F.smooth_l1_loss(valid_pred_boxes, valid_target_boxes, reduction="mean")
+
+#         # --- Calcul de la KLD Loss (pour l'entraînement) ---
+#         # Les boîtes doivent être correctement préparées pour la KLD Loss
+#         valid_pred_boxes_processed = self._prepare_boxes_for_loss(valid_pred_boxes)
+#         valid_target_boxes_processed = self._prepare_boxes_for_loss(valid_target_boxes)
+
+#         kld_loss = torch.tensor(0.0, device=device, requires_grad=True)
+#         try:
+#             pred_mu, pred_sigma = self._obb_to_gaussian_params(valid_pred_boxes_processed)
+#             target_mu, target_sigma = self._obb_to_gaussian_params(valid_target_boxes_processed)
+#             kld_loss = self.kld_calculator(pred_mu, pred_sigma, target_mu, target_sigma)
+#         except Exception as e:
+#             print(f"Warning: KLD loss computation failed: {e}. Returning large loss.")
+#             kld_loss = torch.tensor(100.0, device=device, requires_grad=True)
+
+
+#         # --- Calcul de l'IoU AABB pour le monitoring (SANS gradients) ---
+#         mean_iou_metric = torch.tensor(1.0, device=device) # Par défaut à 1.0 si problème
+#         with torch.no_grad():
+#             try:
+#                 # Convertir cxcywha en xyxy pour box_iou (même si c'est une OBB à la base)
+#                 # Note: box_iou attend (xmin, ymin, xmax, ymax)
+#                 pred_xyxy = self._convert_cxcywha_to_xyxy(valid_pred_boxes_processed)
+#                 target_xyxy = self._convert_cxcywha_to_xyxy(valid_target_boxes_processed)
+
+#                 # Calcul de l'IoU AABB
+#                 iou_matrix = ops.box_iou(pred_xyxy, target_xyxy) # (N, N)
+#                 # Nous voulons l'IoU entre paires correspondantes (diag).
+#                 # Si pred_boxes et target_boxes sont de même taille et correspondent 1:1,
+#                 # on prend la diagonale. Si le batching est plus complexe (e.g., chaque pred vs toutes targets),
+#                 # il faudrait une logique de correspondance plus avancée (ex: Hungarian matching).
+#                 # Pour l'instant, on suppose une correspondance 1:1 pour la métrique.
+#                 if iou_matrix.numel() > 0: # Check if not empty
+#                     mean_iou_metric = torch.diag(iou_matrix).mean()
+#                 else:
+#                      mean_iou_metric = torch.tensor(0.0, device=device) # Si pas de boites, iou 0
+
+#             except Exception as e:
+#                 print(f"Warning: IoU metric computation failed: {e}. Returning 0.0 IoU.")
+#                 mean_iou_metric = torch.tensor(0.0, device=device) # Retourne 0 si échec
+
+
+#         # --- Calcul de la perte totale pondérée ---
+#         weighted_loss = self.l1_weight * l1_loss + self.kld_weight * kld_loss
+
+#         # Mise à jour des valeurs de monitoring
+#         self._update_monitoring_values(l1_loss, kld_loss, weighted_loss, mean_iou_metric)
+
+#         return weighted_loss
+
+#     def _update_monitoring_values(self, l1_loss: torch.Tensor, kld_loss: torch.Tensor,
+#                                   weighted_loss: torch.Tensor, mean_iou_metric: torch.Tensor):
+#         """Met à jour les attributs de monitoring avec les valeurs detachées."""
+#         self._last_l1_loss = l1_loss.detach()
+#         self._last_kld_loss = kld_loss.detach()
+#         self._last_weighted_loss = weighted_loss.detach()
+#         self._last_mean_iou_metric = mean_iou_metric.detach()
+
+
+#     def _validate_shapes(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, valid_mask: torch.Tensor):
+#         """Validation des dimensions des tenseurs"""
+#         assert pred_boxes.shape == target_boxes.shape, \
+#             f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+#         assert pred_boxes.shape[:-1] == valid_mask.shape, \
+#             f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
+
+#     def _prepare_boxes_for_loss(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Préparation et validation des boîtes : conversion vers cxcywha si nécessaire,
+#         clamp des dimensions w/h et normalisation de l'angle.
+#         """
+#         # Assurez-vous que boxes est de la forme (N, D) où D est 4 ou 5
+#         if boxes.dim() == 1:
+#             boxes = boxes.unsqueeze(0)
+
+#         processed_boxes = boxes.clone() # Travailler sur une copie pour éviter les modifications in-place inattendues
+
+#         if self.coord_format == 'xyxy':
+#             # Si xyxy et seulement 4 dims, ajouter un angle 0 par défaut
+#             if processed_boxes.shape[-1] == 4:
+#                 angles = torch.zeros(processed_boxes.shape[0], 1, device=processed_boxes.device, dtype=processed_boxes.dtype)
+#                 processed_boxes = torch.cat([processed_boxes, angles], dim=-1)
+#             # Puis convertir en cxcywha
+#             processed_boxes = self._convert_xyxy_to_cxcywha(processed_boxes)
+#         elif self.coord_format == 'cxcywha':
+#             # Si cxcywh et seulement 4 dims, ajouter un angle 0 par défaut
+#             if processed_boxes.shape[-1] == 4:
+#                 angles = torch.zeros(processed_boxes.shape[0], 1, device=processed_boxes.device, dtype=processed_boxes.dtype)
+#                 processed_boxes = torch.cat([processed_boxes, angles], dim=-1)
+#             # Sinon, le format est déjà cxcywha (avec 5 dims)
+#         else:
+#             raise ValueError(f"Format {self.coord_format} non supporté")
+
+#         # Clamp et normalisation des angles sur le format cxcywha final
+#         cx, cy, w, h, angles = processed_boxes.unbind(-1)
+
+#         # Clamp cx, cy dans [0, coord_max]
+#         cx_clamped = torch.clamp(cx, min=0.0, max=self.coord_max)
+#         cy_clamped = torch.clamp(cy, min=0.0, max=self.coord_max)
+
+#         # Clamp w, h pour qu'ils soient > eps et <= coord_max
+#         w_fixed = torch.clamp(w, min=self.eps, max=self.coord_max)
+#         h_fixed = torch.clamp(h, min=self.eps, max=self.coord_max)
+
+#         # Normalisation de l'angle
+#         if self.angle_normalization == 'symmetric_pi':
+#             angles_normalized = self._normalize_angle_symmetric_pi(angles)
+#         elif self.angle_normalization == 'positive_pi':
+#             angles_normalized = self._normalize_angle_positive_pi(angles)
+#         else:
+#             angles_normalized = angles # Pas de normalisation si non spécifié
+
+#         return torch.stack([cx_clamped, cy_clamped, w_fixed, h_fixed, angles_normalized], dim=-1)
+
+#     def _convert_xyxy_to_cxcywha(self, boxes_xyxy_angle: torch.Tensor) -> torch.Tensor:
+#         """Conversion (xmin,ymin,xmax,ymax,angle) -> (cx,cy,w,h,angle)"""
+#         xmin, ymin, xmax, ymax, angle = boxes_xyxy_angle.unbind(-1)
+
+#         cx = (xmin + xmax) / 2
+#         cy = (ymin + ymax) / 2
+#         w = torch.abs(xmax - xmin) # Utiliser abs car xmax peut être < xmin si predictions folles
+#         h = torch.abs(ymax - ymin) # Utiliser abs car ymax peut être < ymin si predictions folles
+
+#         return torch.stack([cx, cy, w, h, angle], dim=1)
+
+#     def _convert_cxcywha_to_xyxy(self, boxes_cxcywha: torch.Tensor) -> torch.Tensor:
+#         """Conversion (cx,cy,w,h,angle) -> (xmin,ymin,xmax,ymax) pour IoU AABB (ignore l'angle)"""
+#         cx, cy, w, h, _ = boxes_cxcywha.unbind(-1)
+#         xmin = cx - w / 2
+#         ymin = cy - h / 2
+#         xmax = cx + w / 2
+#         ymax = cy + h / 2
+#         return torch.stack([xmin, ymin, xmax, ymax], dim=-1)
+
+
+#     def _normalize_angle_symmetric_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [-π/2, π/2]"""
+#         angles_mod = angles % (2 * math.pi)
+#         angles_wrapped = torch.where(angles_mod > math.pi, angles_mod - 2 * math.pi, angles_mod)
+#         angles_sym1 = torch.where(angles_wrapped > math.pi / 2, angles_wrapped - math.pi, angles_wrapped)
+#         angles_sym2 = torch.where(angles_sym1 < -math.pi / 2, angles_sym1 + math.pi, angles_sym1)
+#         return angles_sym2
+
+#     def _normalize_angle_positive_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [0, π]"""
+#         return angles % math.pi
+
+#     def _obb_to_gaussian_params(self, boxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+#         """
+#         Convertit les paramètres d'OBB (cx, cy, w, h, angle) en paramètres
+#         de distribution Gaussienne 2D (mu, Sigma).
+#         """
+#         cx, cy, w, h, angle = boxes.unbind(-1)
+
+#         mu = torch.stack([cx, cy], dim=-1) # (N, 2)
+
+#         # w et h sont déjà clampés à min=self.eps par _prepare_boxes_for_loss
+#         w_sq_4 = (w**2 / 4)
+#         h_sq_4 = (h**2 / 4)
+
+#         cos_a = torch.cos(angle)
+#         sin_a = torch.sin(angle)
+
+#         R = torch.stack([
+#             torch.stack([cos_a, -sin_a], dim=-1),
+#             torch.stack([sin_a, cos_a], dim=-1)
+#         ], dim=-2) # (N, 2, 2)
+
+#         S = torch.diag_embed(torch.stack([w_sq_4, h_sq_4], dim=-1)) # (N, 2, 2)
+
+#         Sigma = torch.matmul(R, torch.matmul(S, R.transpose(-1, -2))) # (N, 2, 2)
+
+#         return mu, Sigma
+
+#     def get_loss_components(self):
+#         """Retourne les composants de perte pour le monitoring."""
+#         if self._last_l1_loss is None:
+#             device = next(self.parameters()).device if hasattr(self, 'parameters') and next(self.parameters(), None) is not None else torch.device('cpu')
+#             zero = torch.tensor(0.0, device=device)
+#             return {'l1_loss': zero, 'kld_loss': zero, 'iou_metric': zero, 'weighted_loss': zero}
+
+#         return {
+#             'l1_loss': self._last_l1_loss,
+#             'kld_loss': self._last_kld_loss,
+#             'iou_loss': 1-self._last_mean_iou_metric,
+#             'weighted_loss': self._last_weighted_loss
+#         }
+
+
+
+    # def oriented_ciou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> tuple:
+    #     """
+    #     Calcule le Complete IoU (CIoU) orienté entre deux ensembles de boîtes.
+    #     CIoU = IoU - d²/c² - α*v, où v mesure la consistance du ratio d'aspect.
+        
+    #     Args:
+    #         boxes1: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+    #         boxes2: Tensor de forme (N, 5) [cx, cy, w, h, angle]
+            
+    #     Returns:
+    #         tuple (iou, ciou): IoU et CIoU entre les boîtes
+    #     """
+    #     # Calcule d'abord le IoU standard
+    #     iou = self.oriented_iou(boxes1, boxes2)
+        
+    #     # Extraction des coordonnées des centres
+    #     centers1 = boxes1[:, :2]  # [cx, cy]
+    #     centers2 = boxes2[:, :2]  # [cx, cy]
+        
+    #     # Distance euclidienne au carré entre les centres
+    #     d2 = torch.sum((centers1 - centers2) ** 2, dim=1)
+        
+    #     # Conversion en polygones pour obtenir les points extrêmes
+    #     poly1 = self.obb_to_polygon(boxes1)
+    #     poly2 = self.obb_to_polygon(boxes2)
+        
+    #     # Calcul de la plus petite boîte englobant les deux polygones
+    #     min_xy = torch.min(torch.min(poly1, dim=1)[0], torch.min(poly2, dim=1)[0])
+    #     max_xy = torch.max(torch.max(poly1, dim=1)[0], torch.max(poly2, dim=1)[0])
+        
+    #     # Diagonale au carré de la boîte englobante
+    #     c2 = torch.sum((max_xy - min_xy) ** 2, dim=1)
+        
+    #     # Term de distance (DIoU)
+    #     distance_term = d2 / (c2 + self.eps)
+        
+    #     # Calcul du terme de ratio d'aspect
+    #     w1, h1, a1 = boxes1[:, 2], boxes1[:, 3], boxes1[:, 4]
+    #     w2, h2, a2 = boxes2[:, 2], boxes2[:, 3], boxes2[:, 4]
+        
+    #     # Pour les boîtes orientées, nous devons ajuster les largeurs/hauteurs
+    #     # en fonction de l'angle pour un calcul précis du ratio d'aspect
+    #     w1_adjusted = torch.where(torch.abs(torch.sin(a1)) > torch.abs(torch.cos(a1)),
+    #                             h1, w1)
+    #     h1_adjusted = torch.where(torch.abs(torch.sin(a1)) > torch.abs(torch.cos(a1)),
+    #                             w1, h1)
+        
+    #     w2_adjusted = torch.where(torch.abs(torch.sin(a2)) > torch.abs(torch.cos(a2)),
+    #                             h2, w2)
+    #     h2_adjusted = torch.where(torch.abs(torch.sin(a2)) > torch.abs(torch.cos(a2)),
+    #                             w2, h2)
+        
+    #     # Calcul de v (terme de ratio d'aspect)
+    #     # v = (4 / π²) * [arctan(w_gt/h_gt) - arctan(w_pred/h_pred)]²
+    #     v = (4.0 / (math.pi ** 2)) * torch.pow(
+    #         torch.atan(w2_adjusted / (h2_adjusted + self.eps)) - 
+    #         torch.atan(w1_adjusted / (h1_adjusted + self.eps)), 2)
+        
+    #     # Facteur alpha
+    #     alpha = v / ((1 - iou) + v + self.eps)
+        
+    #     # Calcul final du CIoU
+    #     ciou = iou - distance_term - alpha * v
+        
+    #     return iou, torch.clamp(ciou, min=-1.0, max=1.0)
 # def number_loss_fn(logits, targets, mask):
 #     per_element_loss = F.l1_loss(
 #         input=logits[:,:-1].squeeze(-1)*mask[:,1:],
@@ -2762,84 +5223,702 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
 #     else:
 #         return torch.tensor(0.0, device=logits.device)  # Retourne 0 si pas d'éléments
 
-def number_loss_fn(logits, targets, mask):
-    """
-    Args:
-        logits: (batch_size, seq_len, 4) - prédictions des boîtes
-        targets: (batch_size, seq_len, 4) - boîtes cibles  
-        mask: (batch_size, seq_len) ou (batch_size, seq_len, 1) - masque de validité
-    """
-    device = logits.device
-    
-    # Supprimer la dernière position pour logits
-    pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4)
-    target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4)
-    valid_mask = mask[:, 1:]  # (batch_size, seq_len-1) ou (batch_size, seq_len-1, 1)
-    
-    # Gérer la dimension supplémentaire du masque si elle existe
-    if valid_mask.dim() == 3:
-        valid_mask = valid_mask.squeeze(-1)  # (batch_size, seq_len-1)
-    
-    # Vérifier que les dimensions sont cohérentes
-    assert pred_boxes.shape == target_boxes.shape, f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
-    assert pred_boxes.shape[:-1] == valid_mask.shape, f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
-    
-    # Calculer le nombre total d'éléments valides
-    mask_sum = torch.sum(valid_mask)
-    
-    if mask_sum == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-    
-    # === L1 Loss ===
-    # Appliquer le masque élément par élément
-    masked_pred = pred_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
-    masked_target = target_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
-    
-    per_element_loss = F.l1_loss(masked_pred, masked_target, reduction="none")  # (batch_size, seq_len-1, 4)
-    
-    # Sommer seulement sur les éléments valides
-    l1_loss = torch.sum(per_element_loss * valid_mask.unsqueeze(-1)) / (mask_sum * 4)
-    
-    # === IoU Loss ===
-    # Aplatir et filtrer les éléments valides
-    flat_pred = pred_boxes.reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
-    flat_target = target_boxes.reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
-    flat_mask = valid_mask.flatten()  # (batch_size * (seq_len-1),)
-    
-    # Extraire seulement les boîtes valides
-    valid_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(1)
-    
-    if len(valid_indices) == 0:
-        iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
-    else:
-        valid_pred_boxes = flat_pred[valid_indices]  # (num_valid, 4)
-        valid_target_boxes = flat_target[valid_indices]  # (num_valid, 4)
-        
-        # Vérifier que les boîtes sont dans un format valide
-        valid_pred_boxes = ensure_valid_boxes(valid_pred_boxes)
-        valid_target_boxes = ensure_valid_boxes(valid_target_boxes)
-        
-        # Calculer la perte IoU
-        try:
-            iou_loss = generalized_box_iou_loss(valid_pred_boxes, valid_target_boxes, reduction='mean')
-        except Exception as e:
-            print(f"Warning: IoU loss computation failed: {e}")
-            iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
-    
-    return 10*l1_loss + 2*iou_loss
+#-------------------------------------------------------------------------------------
 
-def ensure_valid_boxes(boxes):
-    boxes_clamped = torch.clamp(boxes, min=0.0)
+# class NumberLoss(nn.Module):
+#     """
+#     Loss combinée L1 + IoU orientée optimisée pour la détection de boîtes orientées.
+#     Remplace l'IoU standard par l'IoU orientée pour une meilleure précision.
+#     """
     
-    # S'assurer que x2 > x1 et y2 > y1 sans opérations in-place
-    x1, y1, x2, y2 = boxes_clamped[:, 0], boxes_clamped[:, 1], boxes_clamped[:, 2], boxes_clamped[:, 3]
+#     def __init__(self, 
+#                  l1_weight: float = 10.0,
+#                  iou_weight: float = 2.0,
+#                  iou_type: str = 'iou',  # 'iou', 'giou', 'diou'
+#                  coord_format: str = 'cxcywha',  # 'xyxy', 'cxcywha'
+#                  angle_normalization: str = 'symmetric_pi',
+#                  eps: float = 1e-7):
+#         super().__init__()
+        
+#         self.l1_weight = l1_weight
+#         self.iou_weight = iou_weight
+#         self.coord_format = coord_format
+#         self.eps = eps
+        
+#         # Loss IoU orientée intégrée
+#         self.oriented_iou_loss = OrientedIoULoss(
+#             loss_type=iou_type,
+#             reduction='mean',
+#             eps=eps
+#         )
+        
+#         # Fonction de normalisation d'angle
+#         self.angle_normalization = angle_normalization
     
-    x2_fixed = torch.maximum(x2, x1 + 1e-6)
-    y2_fixed = torch.maximum(y2, y1 + 1e-6)
+#     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             logits: (batch_size, seq_len, 4 ou 5) - prédictions des boîtes
+#             targets: (batch_size, seq_len, 4 ou 5) - boîtes cibles  
+#             mask: (batch_size, seq_len) - masque de validité
+#         """
+#         device = logits.device
+        
+#         # Préparation des données (décalage temporel)
+#         pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4/5)
+#         target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4/5)
+#         valid_mask = mask[:, 1:]  # (batch_size, seq_len-1)
+        
+#         # Normalisation des dimensions du masque
+#         if valid_mask.dim() == 3:
+#             valid_mask = valid_mask.squeeze(-1)
+        
+#         # Validation des dimensions
+#         self._validate_shapes(pred_boxes, target_boxes, valid_mask)
+        
+#         # Calcul du nombre d'éléments valides
+#         mask_sum = torch.sum(valid_mask)
+#         if mask_sum == 0:
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+        
+#         # Calcul des losses
+#         l1_loss = self._compute_l1_loss(pred_boxes, target_boxes, valid_mask, mask_sum)
+#         iou_loss = self._compute_iou_loss(pred_boxes, target_boxes, valid_mask)
+        
+#         return self.l1_weight * l1_loss + self.iou_weight * iou_loss
     
-    # Reconstruire le tenseur sans modification in-place
-    boxes_fixed = torch.stack([x1, y1, x2_fixed, y2_fixed], dim=1)
+#     def _validate_shapes(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, valid_mask: torch.Tensor):
+#         """Validation des dimensions des tenseurs"""
+#         assert pred_boxes.shape == target_boxes.shape, \
+#             f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+#         assert pred_boxes.shape[:-1] == valid_mask.shape, \
+#             f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
     
-    return boxes_fixed
+#     def _compute_l1_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                         valid_mask: torch.Tensor, mask_sum: torch.Tensor) -> torch.Tensor:
+#         """Calcul optimisé de la loss L1 avec masquage"""
+#         # Masquage vectorisé
+#         mask_expanded = valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 1)
+        
+#         # Calcul L1 seulement sur les éléments valides
+#         per_element_loss = F.l1_loss(pred_boxes, target_boxes, reduction="none")  # (B, S, 4/5)
+#         masked_loss = per_element_loss * mask_expanded
+        
+#         # Moyenne sur les éléments valides
+#         num_coords = pred_boxes.shape[-1]  # 4 ou 5 coordonnées
+#         return torch.sum(masked_loss) / (mask_sum * num_coords)
+    
+#     def _compute_iou_loss(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor, 
+#                          valid_mask: torch.Tensor) -> torch.Tensor:
+#         """Calcul optimisé de la loss IoU orientée"""
+#         device = pred_boxes.device
+        
+#         # Filtrage efficace des éléments valides
+#         valid_indices = torch.nonzero(valid_mask.flatten(), as_tuple=False).squeeze(1)
+        
+#         if len(valid_indices) == 0:
+#             return torch.tensor(1.0, device=device, requires_grad=True)
+        
+#         # Extraction des boîtes valides (vectorisé)
+#         flat_pred = pred_boxes.reshape(-1, pred_boxes.shape[-1])
+#         flat_target = target_boxes.reshape(-1, target_boxes.shape[-1])
+        
+#         valid_pred_boxes = flat_pred[valid_indices]
+#         valid_target_boxes = flat_target[valid_indices]
+        
+#         # Préparation des boîtes selon le format
+#         valid_pred_boxes = self._prepare_boxes(valid_pred_boxes)
+#         valid_target_boxes = self._prepare_boxes(valid_target_boxes)
+        
+#         # Calcul de la loss IoU orientée
+#         try:
+#             return self.oriented_iou_loss(valid_pred_boxes, valid_target_boxes)
+#         except Exception as e:
+#             print(f"Warning: Oriented IoU loss computation failed: {e}")
+#             return torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     def _prepare_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Préparation et validation des boîtes selon le format"""
+#         if self.coord_format == 'xyxy':
+#             # Format (xmin, ymin, xmax, ymax) ou (xmin, ymin, xmax, ymax, angle)
+#             if boxes.shape[-1] == 4:
+#                 # Pas d'angle fourni - on assume angle = 0
+#                 angles = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, angles], dim=-1)
+#             elif boxes.shape[-1] == 5:
+#                 # Format (xmin, ymin, xmax, ymax, angle) - déjà avec angle
+#                 boxes_with_angle = boxes
+#             else:
+#                 raise ValueError(f"Format xyxy attendu avec 4 ou 5 dimensions, reçu {boxes.shape[-1]}")
+                
+#             # Conversion vers format cxcywha
+#             boxes_cxcywha = self._convert_xyxy_to_cxcywha(boxes_with_angle)
+#             return self._ensure_valid_oriented_boxes(boxes_cxcywha)
+            
+#         elif self.coord_format == 'cxcywha':
+#             # Format (cx, cy, w, h) ou (cx, cy, w, h, angle) - déjà compatible
+#             if boxes.shape[-1] == 4:
+#                 # Pas d'angle fourni - on assume angle = 0
+#                 angles = torch.zeros(boxes.shape[0], 1, device=boxes.device, dtype=boxes.dtype)
+#                 boxes_with_angle = torch.cat([boxes, angles], dim=-1)
+#             elif boxes.shape[-1] == 5:
+#                 # Format (cx, cy, w, h, angle) - déjà complet
+#                 boxes_with_angle = boxes
+#             else:
+#                 raise ValueError(f"Format cxcywha attendu avec 4 ou 5 dimensions, reçu {boxes.shape[-1]}")
+                
+#             return self._ensure_valid_oriented_boxes(boxes_with_angle)
+#         else:
+#             raise ValueError(f"Format {self.coord_format} non supporté")
 
+#     def _convert_xyxy_to_cxcywha(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Convertit les boîtes du format (xmin, ymin, xmax, ymax, angle) 
+#         vers le format (cx, cy, w, h, angle)
+        
+#         Args:
+#             boxes: tensor de forme (..., 5) avec (xmin, ymin, xmax, ymax, angle)
+            
+#         Returns:
+#             tensor de forme (..., 5) avec (cx, cy, w, h, angle)
+#         """
+#         # Extraction des coordonnées (compatible gradients)
+#         xmin = boxes[..., 0:1]
+#         ymin = boxes[..., 1:2] 
+#         xmax = boxes[..., 2:3]
+#         ymax = boxes[..., 3:4]
+#         angle = boxes[..., 4:5]
+        
+#         # Calcul du centre
+#         cx = (xmin + xmax) * 0.5
+#         cy = (ymin + ymax) * 0.5
+        
+#         # Calcul des dimensions
+#         width = xmax - xmin
+#         height = ymax - ymin
+        
+#         # Assemblage du résultat
+#         result = torch.cat([cx, cy, width, height, angle], dim=-1)
+        
+#         return result
+    
+#     def _convert_xyxy_to_cxcywha(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Conversion (xmin,ymin,xmax,ymax,angle) -> (cx,cy,w,h,angle)"""
+#         xmin, ymin, xmax, ymax = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+#         angle = boxes[:, 4] if boxes.shape[-1] == 5 else torch.zeros_like(xmin)
+        
+#         cx = (xmin + xmax) / 2
+#         cy = (ymin + ymax) / 2
+#         w = torch.abs(xmax - xmin)
+#         h = torch.abs(ymax - ymin)
+        
+#         return torch.stack([cx, cy, w, h, angle], dim=1)
+    
+#     def _ensure_valid_oriented_boxes(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Validation et correction des boîtes orientées - SANS opérations in-place"""
+#         # Clamp des coordonnées (sauf l'angle) - création nouveau tenseur
+#         coords_clamped = torch.clamp(boxes[:, :4], min=0.0)
+        
+#         # S'assurer que width et height sont positives - création nouveaux tenseurs
+#         w_fixed = torch.maximum(coords_clamped[:, 2], torch.full_like(coords_clamped[:, 2], self.eps))
+#         h_fixed = torch.maximum(coords_clamped[:, 3], torch.full_like(coords_clamped[:, 3], self.eps))
+        
+#         # Normalisation de l'angle - création nouveau tenseur
+#         if self.angle_normalization == 'symmetric_pi':
+#             angles_normalized = self._normalize_angle_symmetric_pi(boxes[:, 4])
+#         elif self.angle_normalization == 'positive_pi':
+#             angles_normalized = self._normalize_angle_positive_pi(boxes[:, 4])
+#         else:
+#             angles_normalized = boxes[:, 4]
+        
+#         # Reconstruction complète du tenseur - AUCUNE opération in-place
+#         boxes_fixed = torch.stack([
+#             coords_clamped[:, 0],  # cx
+#             coords_clamped[:, 1],  # cy
+#             w_fixed,               # w
+#             h_fixed,               # h
+#             angles_normalized      # angle
+#         ], dim=1)
+        
+#         return boxes_fixed
+    
+#     def _normalize_angle_symmetric_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [-π/2, π/2] - SANS opérations in-place"""
+#         # Normalisation de base dans [-π, π]
+#         angles_mod = angles % (2 * math.pi)
+#         angles_wrapped = torch.where(angles_mod > math.pi, angles_mod - 2 * math.pi, angles_mod)
+        
+#         # Normalisation dans [-π/2, π/2]
+#         angles_sym1 = torch.where(angles_wrapped > math.pi / 2, angles_wrapped - math.pi, angles_wrapped)
+#         angles_sym2 = torch.where(angles_sym1 < -math.pi / 2, angles_sym1 + math.pi, angles_sym1)
+        
+#         return angles_sym2
+    
+#     def _normalize_angle_positive_pi(self, angles: torch.Tensor) -> torch.Tensor:
+#         """Normalisation dans [0, π] - SANS opérations in-place"""
+#         return angles % math.pi
+
+
+# class OrientedIoULoss(nn.Module):
+#     """Version simplifiée de votre loss IoU orientée pour l'intégration"""
+    
+#     def __init__(self, loss_type: str = 'iou', reduction: str = 'mean', eps: float = 1e-7):
+#         super().__init__()
+#         self.loss_type = loss_type
+#         self.reduction = reduction
+#         self.eps = eps
+    
+#     def forward(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             pred_boxes: (N, 5) [cx, cy, w, h, angle]
+#             target_boxes: (N, 5) [cx, cy, w, h, angle]
+#         """
+#         iou = self.oriented_iou(pred_boxes, target_boxes)
+#         loss = 1.0 - iou
+        
+#         if self.reduction == 'mean':
+#             return loss.mean()
+#         elif self.reduction == 'sum':
+#             return loss.sum()
+#         else:
+#             return loss
+    
+#     def oriented_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Version optimisée du calcul IoU orientée"""
+#         # Conversion en polygones
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Aires des boîtes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+        
+#         # Calcul intersection (version simplifiée pour l'optimisation)
+#         intersection = self.approximate_intersection_area(poly1, poly2, area1, area2)
+        
+#         # Union
+#         union = area1 + area2 - intersection
+        
+#         # IoU avec stabilité numérique
+#         iou = intersection / (union + self.eps)
+#         return torch.clamp(iou, 0.0, 1.0)
+    
+#     def obb_to_polygon(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Conversion OBB -> polygone optimisée - SANS opérations in-place"""
+#         cx, cy, w, h, angle = boxes.unbind(-1)
+        
+#         # Points locaux
+#         w_half, h_half = w / 2, h / 2
+        
+#         # Calcul trigonométrique optimisé
+#         cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+        
+#         # Matrice de rotation appliquée aux 4 coins - création nouveaux tenseurs
+#         corners_x = torch.stack([
+#             -w_half * cos_a + h_half * sin_a + cx,
+#             w_half * cos_a + h_half * sin_a + cx,
+#             w_half * cos_a - h_half * sin_a + cx,
+#             -w_half * cos_a - h_half * sin_a + cx
+#         ], dim=1)
+        
+#         corners_y = torch.stack([
+#             -w_half * sin_a - h_half * cos_a + cy,
+#             w_half * sin_a - h_half * cos_a + cy,
+#             w_half * sin_a + h_half * cos_a + cy,
+#             -w_half * sin_a + h_half * cos_a + cy
+#         ], dim=1)
+        
+#         return torch.stack([corners_x, corners_y], dim=-1)  # (N, 4, 2)
+    
+#     def approximate_intersection_area(self, poly1: torch.Tensor, poly2: torch.Tensor, 
+#                                     area1: torch.Tensor, area2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Approximation rapide de l'aire d'intersection pour l'optimisation.
+#         Utilise une heuristique basée sur la distance entre centres et l'overlap des AABB.
+#         SANS opérations in-place
+#         """
+#         # AABB de chaque polygone
+#         min1 = torch.min(poly1, dim=1)[0]  # (N, 2)
+#         max1 = torch.max(poly1, dim=1)[0]  # (N, 2)
+#         min2 = torch.min(poly2, dim=1)[0]  # (N, 2)
+#         max2 = torch.max(poly2, dim=1)[0]  # (N, 2)
+        
+#         # Intersection des AABB - création nouveaux tenseurs
+#         inter_min = torch.maximum(min1, min2)
+#         inter_max = torch.minimum(max1, max2)
+        
+#         # Aires d'intersection AABB - création nouveaux tenseurs
+#         inter_wh = torch.clamp(inter_max - inter_min, min=0.0)
+#         aabb_intersection = inter_wh[:, 0] * inter_wh[:, 1]
+        
+#         # Heuristique : l'intersection réelle est proportionnelle à l'intersection AABB
+#         # avec un facteur basé sur les aires relatives - création nouveaux tenseurs
+#         min_area = torch.minimum(area1, area2)
+#         intersection_ratio = torch.clamp(aabb_intersection / (min_area + self.eps), 0.0, 1.0)
+        
+#         return intersection_ratio * min_area
+
+#--------------------------------------------------------------------------------------
+
+# def number_loss_fn(logits, targets, mask):
+#     """
+#     Args:
+#         logits: (batch_size, seq_len, 4) - prédictions des boîtes
+#         targets: (batch_size, seq_len, 4) - boîtes cibles  
+#         mask: (batch_size, seq_len) ou (batch_size, seq_len, 1) - masque de validité
+#     """
+#     device = logits.device
+    
+#     # Supprimer la dernière position pour logits
+#     pred_boxes = logits[:, :-1]  # (batch_size, seq_len-1, 4)
+#     target_boxes = targets[:, 1:]  # (batch_size, seq_len-1, 4)
+#     valid_mask = mask[:, 1:]  # (batch_size, seq_len-1) ou (batch_size, seq_len-1, 1)
+    
+#     # Gérer la dimension supplémentaire du masque si elle existe
+#     if valid_mask.dim() == 3:
+#         valid_mask = valid_mask.squeeze(-1)  # (batch_size, seq_len-1)
+    
+#     # Vérifier que les dimensions sont cohérentes
+#     assert pred_boxes.shape == target_boxes.shape, f"Shape mismatch: {pred_boxes.shape} vs {target_boxes.shape}"
+#     assert pred_boxes.shape[:-1] == valid_mask.shape, f"Mask shape mismatch: {pred_boxes.shape[:-1]} vs {valid_mask.shape}"
+    
+#     # Calculer le nombre total d'éléments valides
+#     mask_sum = torch.sum(valid_mask)
+    
+#     if mask_sum == 0:
+#         return torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     # === L1 Loss ===
+#     # Appliquer le masque élément par élément
+#     masked_pred = pred_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
+#     masked_target = target_boxes * valid_mask.unsqueeze(-1)  # (batch_size, seq_len-1, 4)
+    
+#     per_element_loss = F.l1_loss(masked_pred, masked_target, reduction="none")  # (batch_size, seq_len-1, 4)
+    
+#     # Sommer seulement sur les éléments valides
+#     l1_loss = torch.sum(per_element_loss * valid_mask.unsqueeze(-1)) / (mask_sum * 4)
+#     # penalty = coord_penalty(masked_pred[valid_mask.unsqueeze(-1)], max_coord=1.0)
+    
+#     # === IoU Loss ===
+#     # Aplatir et filtrer les éléments valides
+#     flat_pred = pred_boxes[:,:,:4].reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
+#     flat_target = target_boxes[:,:,:4].reshape(-1, 4)  # (batch_size * (seq_len-1), 4)
+#     flat_mask = valid_mask.flatten()  # (batch_size * (seq_len-1),)
+    
+#     # Extraire seulement les boîtes valides
+#     valid_indices = torch.nonzero(flat_mask, as_tuple=False).squeeze(1)
+    
+#     if len(valid_indices) == 0:
+#         iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
+#     else:
+#         valid_pred_boxes = flat_pred[valid_indices]  # (num_valid, 4)
+#         valid_target_boxes = flat_target[valid_indices]  # (num_valid, 4)
+        
+#         # Vérifier que les boîtes sont dans un format valide
+#         valid_pred_boxes = ensure_valid_boxes(valid_pred_boxes)
+#         valid_target_boxes = ensure_valid_boxes(valid_target_boxes)
+        
+#         # Calculer la perte IoU
+#         try:
+#             iou_loss = generalized_box_iou_loss(valid_pred_boxes, valid_target_boxes, reduction='mean')
+#         except Exception as e:
+#             print(f"Warning: IoU loss computation failed: {e}")
+#             iou_loss = torch.tensor(0.0, device=device, requires_grad=True)
+    
+#     return 10*l1_loss + 2*iou_loss
+
+# def ensure_valid_boxes(boxes):
+#     boxes_clamped = torch.clamp(boxes, min=0.0)
+    
+#     # S'assurer que x2 > x1 et y2 > y1 sans opérations in-place
+#     x1, y1, x2, y2 = boxes_clamped[:, 0], boxes_clamped[:, 1], boxes_clamped[:, 2], boxes_clamped[:, 3]
+    
+#     x2_fixed = torch.maximum(x2, x1 + 1e-6)
+#     y2_fixed = torch.maximum(y2, y1 + 1e-6)
+    
+#     # Reconstruire le tenseur sans modification in-place
+#     boxes_fixed = torch.stack([x1, y1, x2_fixed, y2_fixed], dim=1)
+    
+#     return boxes_fixed
+
+
+# class OrientedIoULoss(nn.Module):
+#     """
+#     Loss IoU orientée optimisée pour la détection de documents.
+#     Calcul exact et différentiable de l'intersection de polygones convexes.
+#     """
+    
+#     def __init__(self, 
+#                  loss_type: str = 'iou',  # 'iou', 'giou', 'diou', 'ciou'
+#                  reduction: str = 'mean',
+#                  eps: float = 1e-7):
+#         super().__init__()
+#         self.loss_type = loss_type
+#         self.reduction = reduction
+#         self.eps = eps
+    
+#     def forward(self, pred_boxes: torch.Tensor, target_boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Args:
+#             pred_boxes: (N, 5) [cx, cy, w, h, angle] ou (N, 5) [xmin, ymin, xmax, ymax, angle]
+#             target_boxes: (N, 5) [cx, cy, w, h, angle] ou (N, 5) [xmin, ymin, xmax, ymax, angle]
+#         """
+#         # Conversion vers format (cx, cy, w, h, angle) si nécessaire
+#         pred_boxes = self.ensure_cxcywha_format(pred_boxes)
+#         target_boxes = self.ensure_cxcywha_format(target_boxes)
+        
+#         if self.loss_type == 'iou':
+#             iou = self.oriented_iou(pred_boxes, target_boxes)
+#             loss = 1.0 - iou
+#         elif self.loss_type == 'giou':
+#             loss = self.oriented_giou_loss(pred_boxes, target_boxes)
+#         elif self.loss_type in ['diou', 'ciou']:
+#             loss = self.oriented_distance_iou_loss(pred_boxes, target_boxes)
+#         else:
+#             raise ValueError(f"Loss type {self.loss_type} not supported")
+        
+#         return self._reduce_loss(loss)
+    
+#     def ensure_cxcywha_format(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """Convertit (xmin,ymin,xmax,ymax,angle) vers (cx,cy,w,h,angle) si nécessaire"""
+#         # Détection automatique du format basée sur les valeurs
+#         # Si les 2 premières valeurs sont généralement plus petites que les 2 suivantes,
+#         # on assume le format (xmin,ymin,xmax,ymax,angle)
+#         if boxes.shape[-1] != 5:
+#             raise ValueError("Les boîtes doivent avoir 5 dimensions")
+            
+#         # Test simple : si x1 < x2 et y1 < y2 pour la plupart des échantillons
+#         x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+#         is_xyxy_format = ((x1 < x2) & (y1 < y2)).float().mean() > 0.8
+        
+#         if is_xyxy_format:
+#             # Conversion (xmin,ymin,xmax,ymax,angle) -> (cx,cy,w,h,angle)
+#             cx = (boxes[:, 0] + boxes[:, 2]) / 2
+#             cy = (boxes[:, 1] + boxes[:, 3]) / 2
+#             w = torch.abs(boxes[:, 2] - boxes[:, 0])
+#             h = torch.abs(boxes[:, 3] - boxes[:, 1])
+#             angle = boxes[:, 4]
+#             return torch.stack([cx, cy, w, h, angle], dim=1)
+#         else:
+#             return boxes  # Déjà au bon format
+    
+#     def oriented_iou(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """Calcul IoU orientée exact et différentiable"""
+#         # Conversion en polygones
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Aires des boîtes
+#         area1 = boxes1[:, 2] * boxes1[:, 3]  # w * h
+#         area2 = boxes2[:, 2] * boxes2[:, 3]  # w * h
+        
+#         # Calcul intersection exact
+#         intersection = self.convex_polygon_intersection_area(poly1, poly2)
+        
+#         # Union
+#         union = area1 + area2 - intersection
+        
+#         # IoU avec stabilité numérique
+#         iou = intersection / (union + self.eps)
+#         return torch.clamp(iou, 0.0, 1.0)
+    
+#     def obb_to_polygon(self, boxes: torch.Tensor) -> torch.Tensor:
+#         """
+#         Convertit OBB vers polygone (4 sommets).
+#         Args:
+#             boxes: (N, 5) [cx, cy, w, h, angle]
+#         Returns:
+#             polygons: (N, 4, 2) coordonnées des 4 sommets
+#         """
+#         cx, cy, w, h, angle = boxes.unbind(-1)
+        
+#         # Points locaux (rectangle centré à l'origine)
+#         w_half, h_half = w / 2, h / 2
+#         corners_local = torch.stack([
+#             torch.stack([-w_half, -h_half], dim=-1),  # bottom-left
+#             torch.stack([w_half, -h_half], dim=-1),   # bottom-right  
+#             torch.stack([w_half, h_half], dim=-1),    # top-right
+#             torch.stack([-w_half, h_half], dim=-1)    # top-left
+#         ], dim=1)  # (N, 4, 2)
+        
+#         # Rotation
+#         cos_a, sin_a = torch.cos(angle), torch.sin(angle)
+#         rotation_matrix = torch.stack([
+#             torch.stack([cos_a, -sin_a], dim=-1),
+#             torch.stack([sin_a, cos_a], dim=-1)
+#         ], dim=1)  # (N, 2, 2)
+        
+#         # Application rotation + translation
+#         corners_rotated = torch.matmul(corners_local, rotation_matrix.transpose(-2, -1))
+#         center = torch.stack([cx, cy], dim=-1).unsqueeze(1)  # (N, 1, 2)
+#         corners_global = corners_rotated + center
+        
+#         return corners_global
+    
+#     def convex_polygon_intersection_area(self, poly1: torch.Tensor, poly2: torch.Tensor) -> torch.Tensor:
+#         """
+#         Calcul exact de l'aire d'intersection entre polygones convexes.
+#         Utilise l'algorithme de Sutherland-Hodgman modifié pour être différentiable.
+#         """
+#         batch_size = poly1.shape[0]
+#         intersection_areas = torch.zeros(batch_size, device=poly1.device, dtype=poly1.dtype)
+        
+#         for i in range(batch_size):
+#             # Intersection par clipping successif
+#             subject_polygon = poly1[i]  # (4, 2)
+#             clip_polygon = poly2[i]     # (4, 2)
+            
+#             # Algorithme de Sutherland-Hodgman
+#             output_list = subject_polygon
+            
+#             for j in range(4):  # Pour chaque arête du polygone de clipping
+#                 if output_list.shape[0] < 3:
+#                     break
+                    
+#                 # Arête courante du polygone de clipping
+#                 clip_vertex1 = clip_polygon[j]
+#                 clip_vertex2 = clip_polygon[(j + 1) % 4]
+                
+#                 input_list = output_list
+#                 if input_list.shape[0] == 0:
+#                     break
+                    
+#                 output_list = torch.zeros((0, 2), device=poly1.device, dtype=poly1.dtype)
+                
+#                 if input_list.shape[0] > 0:
+#                     s = input_list[-1]  # Dernier point
+                    
+#                 for k in range(input_list.shape[0]):
+#                     e = input_list[k]  # Point courant
+                    
+#                     if self._inside_edge(e, clip_vertex1, clip_vertex2):
+#                         if not self._inside_edge(s, clip_vertex1, clip_vertex2):
+#                             # Intersection
+#                             intersection_point = self._line_intersection(
+#                                 s, e, clip_vertex1, clip_vertex2
+#                             )
+#                             if intersection_point is not None:
+#                                 output_list = torch.cat([output_list, intersection_point.unsqueeze(0)])
+#                         output_list = torch.cat([output_list, e.unsqueeze(0)])
+#                     elif self._inside_edge(s, clip_vertex1, clip_vertex2):
+#                         # Intersection
+#                         intersection_point = self._line_intersection(
+#                             s, e, clip_vertex1, clip_vertex2
+#                         )
+#                         if intersection_point is not None:
+#                             output_list = torch.cat([output_list, intersection_point.unsqueeze(0)])
+                    
+#                     s = e
+            
+#             # Calcul de l'aire du polygone résultant
+#             if output_list.shape[0] >= 3:
+#                 intersection_areas[i] = self._polygon_area(output_list)
+        
+#         return torch.clamp(intersection_areas, 0.0)
+    
+#     def _inside_edge(self, point: torch.Tensor, edge_start: torch.Tensor, edge_end: torch.Tensor) -> bool:
+#         """Teste si un point est à l'intérieur d'une arête (à gauche)"""
+#         return ((edge_end[0] - edge_start[0]) * (point[1] - edge_start[1]) - 
+#                 (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0])) >= 0
+    
+#     def _line_intersection(self, p1: torch.Tensor, p2: torch.Tensor, 
+#                           p3: torch.Tensor, p4: torch.Tensor) -> Optional[torch.Tensor]:
+#         """Calcule l'intersection entre deux segments [p1,p2] et [p3,p4]"""
+#         x1, y1 = p1[0], p1[1]
+#         x2, y2 = p2[0], p2[1]
+#         x3, y3 = p3[0], p3[1]
+#         x4, y4 = p4[0], p4[1]
+        
+#         denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        
+#         if torch.abs(denom) < self.eps:
+#             return None  # Lignes parallèles
+        
+#         t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom
+        
+#         intersection_x = x1 + t * (x2 - x1)
+#         intersection_y = y1 + t * (y2 - y1)
+        
+#         return torch.stack([intersection_x, intersection_y])
+    
+#     def _polygon_area(self, vertices: torch.Tensor) -> torch.Tensor:
+#         """Calcule l'aire d'un polygone avec la formule du lacet (shoelace)"""
+#         if vertices.shape[0] < 3:
+#             return torch.tensor(0.0, device=vertices.device, dtype=vertices.dtype)
+        
+#         x = vertices[:, 0]
+#         y = vertices[:, 1]
+        
+#         # Formule du lacet
+#         area = 0.5 * torch.abs(
+#             torch.sum(x[:-1] * y[1:] - x[1:] * y[:-1]) + 
+#             x[-1] * y[0] - x[0] * y[-1]
+#         )
+        
+#         return area
+    
+#     def oriented_giou_loss(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """GIoU orientée pour une meilleure convergence"""
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Calcul de la plus petite boîte englobante
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+        
+#         # Union des deux polygones pour calculer l'aire de la boîte englobante
+#         all_points = torch.cat([poly1, poly2], dim=1)  # (N, 8, 2)
+        
+#         # Boîte englobante axis-aligned
+#         min_coords = torch.min(all_points, dim=1)[0]  # (N, 2)
+#         max_coords = torch.max(all_points, dim=1)[0]  # (N, 2)
+        
+#         enclosing_area = (max_coords[:, 0] - min_coords[:, 0]) * (max_coords[:, 1] - min_coords[:, 1])
+        
+#         # Aires des boîtes originales
+#         area1 = boxes1[:, 2] * boxes1[:, 3]
+#         area2 = boxes2[:, 2] * boxes2[:, 3]
+#         union = area1 + area2 - iou * area1  # approximation
+        
+#         giou = iou - (enclosing_area - union) / (enclosing_area + self.eps)
+#         return 1.0 - giou
+    
+#     def oriented_distance_iou_loss(self, boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+#         """DIoU orientée - prend en compte la distance entre centres"""
+#         iou = self.oriented_iou(boxes1, boxes2)
+        
+#         # Distance entre centres
+#         center_distance = torch.sum((boxes1[:, :2] - boxes2[:, :2]) ** 2, dim=1)
+        
+#         # Diagonale de la boîte englobante
+#         poly1 = self.obb_to_polygon(boxes1)
+#         poly2 = self.obb_to_polygon(boxes2)
+#         all_points = torch.cat([poly1, poly2], dim=1)
+        
+#         min_coords = torch.min(all_points, dim=1)[0]
+#         max_coords = torch.max(all_points, dim=1)[0]
+#         diagonal_squared = torch.sum((max_coords - min_coords) ** 2, dim=1)
+        
+#         diou = iou - center_distance / (diagonal_squared + self.eps)
+#         return 1.0 - diou
+    
+#     def _reduce_loss(self, loss: torch.Tensor) -> torch.Tensor:
+#         """Applique la réduction spécifiée"""
+#         if self.reduction == 'mean':
+#             return loss.mean()
+#         elif self.reduction == 'sum':
+#             return loss.sum()
+#         else:
+#             return loss
+
+# # Fonctions utilitaires pour la conversion de formats
+# def convert_xyxy_to_cxcywha(boxes_xyxy: torch.Tensor, angles: torch.Tensor) -> torch.Tensor:
+#     """Convertit (xmin,ymin,xmax,ymax) + angles vers (cx,cy,w,h,angle)"""
+#     cx = (boxes_xyxy[:, 0] + boxes_xyxy[:, 2]) / 2
+#     cy = (boxes_xyxy[:, 1] + boxes_xyxy[:, 3]) / 2
+#     w = boxes_xyxy[:, 2] - boxes_xyxy[:, 0]
+#     h = boxes_xyxy[:, 3] - boxes_xyxy[:, 1]
+#     return torch.stack([cx, cy, w, h, angles], dim=1)
+
+    
 __all__ = ["LeL2_ForConditionalGeneration", "Qwen2_5_VLModel", "Qwen2_5_VLPreTrainedModel", "Qwen2_5_VLTextModel"]
