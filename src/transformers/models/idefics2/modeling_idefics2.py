@@ -147,8 +147,11 @@ class Idefics2VisionEmbeddings(nn.Module):
             nb_patches_h = p_attn_mask[:, 0].sum()
             nb_patches_w = p_attn_mask[0].sum()
 
-            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / nb_patches_h)
-            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / nb_patches_w)
+            h_indices = torch.arange(nb_patches_h, device=position_ids.device, dtype=position_ids.dtype)
+            w_indices = torch.arange(nb_patches_w, device=position_ids.device, dtype=position_ids.dtype)
+
+            fractional_coords_h = h_indices / nb_patches_h * (1 - 1e-6)
+            fractional_coords_w = w_indices / nb_patches_w * (1 - 1e-6)
 
             bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
             bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
@@ -451,7 +454,7 @@ class Idefics2Encoder(nn.Module):
 
 @auto_docstring
 class Idefics2PreTrainedModel(PreTrainedModel):
-    config_class = Idefics2Config
+    config: Idefics2Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["Idefics2VisionAttention", "Idefics2MLP", "Idefics2PerceiverLayer", "Idefics2DecoderLayer"]
@@ -459,7 +462,7 @@ class Idefics2PreTrainedModel(PreTrainedModel):
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
-    _supports_cache_class = True
+
     _supports_attention_backend = True
 
     def _init_weights(self, module):
@@ -492,7 +495,7 @@ class Idefics2PreTrainedModel(PreTrainedModel):
     """
 )
 class Idefics2VisionTransformer(Idefics2PreTrainedModel):
-    config_class = Idefics2VisionConfig
+    config: Idefics2VisionConfig
     _supports_sdpa = True
     _supports_flash_attn = True
     _supports_flex_attn = True
@@ -779,7 +782,7 @@ class Idefics2PerceiverLayer(nn.Module):
     """
 )
 class Idefics2PerceiverResampler(Idefics2PreTrainedModel):
-    config_class = Idefics2PerceiverConfig
+    config: Idefics2PerceiverConfig
     _supports_sdpa = True
     _supports_flash_attention_2 = True
     _supports_flex_attn = True
@@ -1140,12 +1143,6 @@ class Idefics2ForConditionalGeneration(Idefics2PreTrainedModel, GenerationMixin)
 
     def set_input_embeddings(self, value):
         self.model.text_model.set_input_embeddings(value)
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
 
     def get_image_features(self, pixel_values: torch.FloatTensor, pixel_attention_mask: torch.LongTensor = None):
         return self.model.get_image_features(pixel_values=pixel_values, pixel_attention_mask=pixel_attention_mask)

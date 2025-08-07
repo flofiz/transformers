@@ -39,7 +39,7 @@ if is_flash_attn_available():
 logger = logging.get_logger(__name__)
 
 
-# Copied from transformers.models.mixtral.modeling_mixtral.load_balancing_loss_func
+# Copied from transformers.models.qwen2_moe.modeling_qwen2_moe.load_balancing_loss_func
 def load_balancing_loss_func(
     gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
     num_experts: Optional[int] = None,
@@ -108,8 +108,8 @@ def load_balancing_loss_func(
         # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
         router_per_expert_attention_mask = (
             attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
+            .expand((num_hidden_layers, batch_size, sequence_length, routing_weights.shape[1]))
+            .reshape(-1, routing_weights.shape[1])
             .to(compute_device)
         )
 
@@ -118,7 +118,11 @@ def load_balancing_loss_func(
             router_per_expert_attention_mask, dim=0
         )
 
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    device_index = routing_weights.device.index if routing_weights.device.index is not None else 0
+    rank = routing_weights.shape[1] * int(device_index)
+    overall_loss = torch.sum(
+        tokens_per_expert[:, rank : rank + routing_weights.shape[1]] * router_prob_per_expert.unsqueeze(0)
+    )
     return overall_loss * num_experts
 
 
@@ -144,6 +148,8 @@ class OlmoeRMSNorm(nn.Module):
 
 # Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Olmoe
 class OlmoeRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
     def __init__(self, config: OlmoeConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
@@ -538,7 +544,7 @@ class OlmoeSdpaAttention(OlmoeAttention):
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
         # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        is_causal = True if causal_mask is None and q_len > 1 else False
+        is_causal = causal_mask is None and q_len > 1
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
@@ -698,16 +704,15 @@ class OlmoeDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class OlmoePreTrainedModel(PreTrainedModel):
-    config_class = OlmoeConfig
+    config: OlmoeConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _no_split_modules = ["OlmoeDecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
-    _supports_static_cache = False  # MoE models don't work with torch.compile (`torch.where(condition)` not supported)
+
+    _can_compile_fullgraph = False  # MoE models don't work with torch.compile (`torch.where(condition)` not supported)
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -740,12 +745,6 @@ class OlmoeModel(OlmoePreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.embed_tokens = value
 
     @auto_docstring
     def forward(
@@ -992,18 +991,6 @@ class OlmoeForCausalLM(OlmoePreTrainedModel, GenerationMixin):
         self.num_experts_per_tok = config.num_experts_per_tok
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
-    def set_input_embeddings(self, value):
-        self.model.embed_tokens = value
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):
         self.model = decoder

@@ -19,7 +19,6 @@ from ..llama.modeling_llama import (
     LlamaForSequenceClassification,
     LlamaForTokenClassification,
     LlamaModel,
-    LlamaPreTrainedModel,
     LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     eager_attention_forward,  # copied from Llama
@@ -59,7 +58,7 @@ class PhiAttention(LlamaAttention):
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -167,22 +166,6 @@ class PhiDecoderLayer(GradientCheckpointingLayer):
 
 class PhiRotaryEmbedding(LlamaRotaryEmbedding):
     pass
-
-
-class PhiPreTrainedModel(LlamaPreTrainedModel):
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
-            module.bias.data.zero_()
 
 
 class PhiModel(LlamaModel):
@@ -307,7 +290,7 @@ class PhiForTokenClassification(LlamaForTokenClassification):
 
 
 __all__ = [
-    "PhiPreTrainedModel",
+    "PhiPreTrainedModel",  # noqa: F822
     "PhiModel",
     "PhiForCausalLM",
     "PhiForSequenceClassification",

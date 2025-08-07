@@ -254,6 +254,8 @@ class GPTNeoXLayer(GradientCheckpointingLayer):
 
 
 class GPTNeoXRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
     def __init__(self, config: GPTNeoXConfig, device=None):
         super().__init__()
         # BC: "rope_type" was originally "type"
@@ -329,7 +331,7 @@ class GPTNeoXDecoderLayer(GradientCheckpointingLayer):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[TransformersKwargs],
-    ) -> tuple[torch.Tensor]:
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
@@ -355,7 +357,7 @@ class GPTNeoXDecoderLayer(GradientCheckpointingLayer):
 
 @auto_docstring
 class GPTNeoXPreTrainedModel(PreTrainedModel):
-    config_class = GPTNeoXConfig
+    config: GPTNeoXConfig
     base_model_prefix = "gpt_neox"
     supports_gradient_checkpointing = True
     _no_split_modules = ["GPTNeoXLayer"]
@@ -363,29 +365,14 @@ class GPTNeoXPreTrainedModel(PreTrainedModel):
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
-    _supports_cache_class = True
-    _supports_quantized_cache = True
-    _supports_static_cache = True
+
+    _can_compile_fullgraph = True
     _supports_attention_backend = True
     _can_record_outputs = {
         "hidden_states": GPTNeoXDecoderLayer,
         "attentions": GPTNeoXAttention,
     }
     _keys_to_ignore_on_load_unexpected = [r"attention.bias", r"attention.masked_bias"]
-
-    def _init_weights(self, module):
-        """Initialize the weights"""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
 
 
 @auto_docstring
@@ -403,12 +390,6 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def get_input_embeddings(self):
-        return self.embed_in
-
-    def set_input_embeddings(self, value):
-        self.embed_in = value
 
     @check_model_inputs
     @auto_docstring
@@ -521,6 +502,12 @@ class GPTNeoXModel(GPTNeoXPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
+
+    def get_input_embeddings(self):
+        return self.embed_in
+
+    def set_input_embeddings(self, value):
+        self.embed_in = value
 
 
 @auto_docstring(
