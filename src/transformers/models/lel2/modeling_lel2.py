@@ -987,7 +987,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(config.vision_config)
         self.language_model = Qwen2_5_VLTextModel._from_config(config.text_config)
         self.rope_deltas = None  # cache rope_deltas here
-        self.number_encoder = nn.Linear(5, config.hidden_size, bias=False) #added
+        self.language_model.number_encoder = nn.Linear(5, config.hidden_size, bias=False) #added
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1225,15 +1225,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             inputs_embeds = self.get_input_embeddings()(input_ids)
             
             if number_ids is not None:
-                # if number_ids.shape==input_ids.shape:
-                #     numbers_embeds = number_ids.to(inputs_embeds.dtype).unsqueeze(-1)
-                # else:
-                #     numbers_embeds = torch.ones_like(input_ids, dtype = inputs_embeds.dtype)
-                #     # numbers_embeds = self.number_encoder(numbers_values) #added
-                #     numbers_mask = (input_ids==self.config.number_token_id)
-                #     numbers_embeds = numbers_embeds.masked_scatter(numbers_mask, number_ids.to(numbers_embeds.dtype)).unsqueeze(-1)
-                #     print("dtype = ", number_ids.shape, input_ids.shape(), flush = True)
-                numbers_embeds = self.number_encoder(number_ids)
+                numbers_embeds = self.language_model.number_encoder(number_ids)
                 numbers_mask = (input_ids==self.config.number_token_id)
                 inputs_embeds = torch.where(numbers_mask.unsqueeze(-1), inputs_embeds * numbers_embeds, inputs_embeds)
                 # inputs_embeds = inputs_embeds*numbers_embeds
