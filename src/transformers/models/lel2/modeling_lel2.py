@@ -1319,12 +1319,12 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
+        number_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        # Backward compatibility: user may pass labels=(text_labels, number_labels)
-        labels: Optional[Union[torch.LongTensor, Tuple[torch.LongTensor, torch.FloatTensor], List]] = None,
-        number_labels: Optional[torch.FloatTensor] = None,   # preferred explicit
-        number_history: Optional[torch.FloatTensor] = None,
-        number_mask_history: Optional[torch.BoolTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1334,49 +1334,19 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
         rope_deltas: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         second_per_grid_ts: Optional[torch.Tensor] = None,
-        inject_coordinates: bool = True,
-        **kwargs,
-    ):
-        """
-        labels: can be
-            - tensor (B,S) -> text labels
-            - tuple/list (text_labels, number_labels)
-        number_labels: (B,S,5) if provided separately
-        """
+    ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
+
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        number_token_id = self.config.number_token_id
-
-        text_labels = None
-
-        # Backward compatibility parsing
-        if labels is not None:
-            if isinstance(labels, (list, tuple)):
-                if len(labels) > 0:
-                    text_labels = labels[0]
-                if len(labels) > 1 and number_labels is None:
-                    number_labels = labels[1]
-            else:
-                text_labels = labels
-        # Ensure tensors
-        if text_labels is not None and not torch.is_tensor(text_labels):
-            text_labels = torch.as_tensor(text_labels, dtype=torch.long, device=input_ids.device)
-        if number_labels is not None and not torch.is_tensor(number_labels):
-            number_labels = torch.as_tensor(number_labels, dtype=torch.float32, device=input_ids.device)
-
-        # Build number_history if not supplied (teacher forcing)
-        if number_history is None and number_labels is not None:
-            number_history = number_labels.detach()
-        if number_mask_history is None:
-            number_mask_history = (input_ids == number_token_id)
 
         outputs = self.model(
-            input_ids=input_ids,
-            number_ids=number_history,
-            number_mask=number_mask_history,
+            input_ids=input_ids, 
+            number_ids=number_ids, # ToDo : ajouter number_ids partout pour propager
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -1385,70 +1355,52 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             position_ids=position_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=True,
+            return_dict=return_dict,
             cache_position=cache_position,
-            inject_coordinates=inject_coordinates,
         )
 
-        hidden_states = outputs.last_hidden_state  # (B,S,H)
+        hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-
-        coord_mask = (input_ids == number_token_id)
-        if coord_mask.any():
-            selected_hidden = hidden_states[coord_mask]                    # (N,H) dtype = hidden_states.dtype (souvent bf16)
-            pred_coords_subset = self.numbers_head(selected_hidden)        # (N,5) dtype aligné au hidden (grâce au .to(orig_dtype))
-            logits_number = hidden_states.new_zeros(hidden_states.size(0), hidden_states.size(1), 5)
-            # S'assurer du même dtype (sécurité supplémentaire)
-            if pred_coords_subset.dtype != logits_number.dtype:
-                pred_coords_subset = pred_coords_subset.to(logits_number.dtype)
-            logits_number[coord_mask] = pred_coords_subset
-        else:
-            logits_number = hidden_states.new_zeros(hidden_states.size(0), hidden_states.size(1), 5)
-
-        # --- Loss ---
-        if text_labels is not None:
-            lm_loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            lm_loss = lm_loss_fct(
-                logits[:, :-1, :].contiguous().view(-1, logits.size(-1)),
-                text_labels[:, 1:].contiguous().view(-1),
-            )
-
-            if number_labels is not None:
-                target_coord_mask = (text_labels == number_token_id)
-                pred_filtered = logits_number[target_coord_mask]
-                tgt_filtered = number_labels[target_coord_mask]
-
-                if pred_filtered.numel() > 0:
-                    # Monter en float32 pour la KLD (inversions matrices stables)
-                    pred_fp32 = pred_filtered.float()
-                    tgt_fp32  = tgt_filtered.float()
-                    total_loc = self.localisation_loss(pred_fp32, tgt_fp32)
-                    comp = self.localisation_loss.get_loss_components()
-                    coord_loss = total_loc
-                    kld_loss  = comp["kld_loss"]
-                    l1_loss   = comp["l1_loss"]
-                    iou_metric = comp["iou_metric"]
-                else:
-                    zero = logits.new_zeros(())
-                    coord_loss = kld_loss = l1_loss = iou_metric = zero
-                loss = lm_loss + coord_loss
-            else:
-                loss = lm_loss
+        logits_number = self.numbers_head(hidden_states)
+        # logits_number = torch.clamp(logits_number, min = 0, max = 2)
+        loss = None
+        lm_loss = None
+        l1_loss = None
+        iou_metric = None
+        kld_loss = None
+        coord_loss = None
+        if labels is not None:
+            text_labels, number_labels = labels
+            lm_loss = self.loss_function(logits=logits, labels=text_labels, vocab_size=self.config.vocab_size)
+            target_coord_mask = (text_labels == self.config.number_token_id)
+            pred_filtered = logits_number[target_coord_mask]
+            tgt_filtered = number_labels[target_coord_mask]
+            # number_loss = torch.sum(F.smooth_l1_loss(input=logits_number[:,:-1].squeeze(-1)*number_mask[:,1:],target=number_ids[:,1:]*number_mask[:,1:], reduction="none"))/torch.sum(number_mask)
+            # coord_loss = number_loss_fn(logits_number, number_label, number_mask)
+            pred_fp32 = pred_filtered.float()
+            tgt_fp32  = tgt_filtered.float()
+            coord_loss = self.localisation_loss(pred_fp32, tgt_fp32)
+            loss_components = self.localisation_loss.get_loss_components()
+            l1_loss = loss_components.get("l1_loss", None)
+            iou_metric = loss_components.get("iou_metric", None)
+            kld_loss = loss_components.get("kld_loss", None)
+            loss = 1*lm_loss + 1*coord_loss
 
         if not return_dict:
-            output = (logits, logits_number, outputs.past_key_values, outputs.hidden_states, outputs.attentions)
-            return ((loss, lm_loss, coord_loss) + output) if loss is not None else output
+            output = (logits,logits_number, ) + outputs[1:]
+            return (loss,) + output if loss is not None else output
 
         return Qwen2_5_VLCausalLMOutputWithPast(
             loss=loss,
-            lm_loss=lm_loss,
-            coord_loss=coord_loss,
-            kld_loss=kld_loss,
-            l1_loss=l1_loss,
-            iou_metric=iou_metric,
+            lm_loss = lm_loss,
+            l1_loss = l1_loss,
+            iou_metric = iou_metric,
+            kld_loss = kld_loss,
+            coord_loss = coord_loss,
             logits=logits,
             logits_number=logits_number,
             past_key_values=outputs.past_key_values,
