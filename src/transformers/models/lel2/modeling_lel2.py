@@ -11,7 +11,6 @@
 #       (no implicit shift). This clarifies alignment.
 #     - Compute number head ONLY on masked coordinate positions for efficiency; scatter results back into a
 #       dense tensor for logging / later usage.
-#     - During generation maintain a number_history (B, seq, 5) and a number_mask_history (B, seq) buffer.
 #       These are passed forward in model_kwargs for autoregressive conditioning (if desired).
 #     - Provide robust prepare_inputs_for_generation handling of coordinate buffers.
 #     - Provide an option to inject coordinate embeddings multiplicatively (your chosen method)
@@ -887,7 +886,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
         self,
         input_ids: torch.LongTensor = None,
         number_ids: Optional[torch.FloatTensor] = None,   ### MOD (full tensor of shape (B,S,5) or None)
-        number_mask: Optional[torch.BoolTensor] = None,   ### MOD (shape (B,S)) indicates which positions have coords)
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -907,7 +905,6 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
     ):
         """
         number_ids: real-valued coords (B,S,5) scaled approx in [0,2] & angle in [-pi/2,pi/2]
-        number_mask: bool (B,S) True where input_ids == number_token_id (or where coords known)
         inject_coordinates: if True, multiplicative injection on those positions.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -970,8 +967,9 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
                 position_ids = base_pos.unsqueeze(0).expand(3, -1, -1)
 
         # Coordinate injection (multiplicative gating)
-        if inject_coordinates and number_ids is not None and number_mask is not None:
+        if inject_coordinates and number_ids is not None:
             # We project raw coords through existing number_encoder
+            numbers_mask = (input_ids==self.config.number_token_id)
             coord_proj = self.language_model.number_encoder(number_ids.to(inputs_embeds.dtype))  # (B,S,H)
             # Safe scaling: (1 + normalized factor) to avoid annihilating embeddings
             # clamp to keep stability
@@ -982,7 +980,7 @@ class Qwen2_5_VLModel(Qwen2_5_VLPreTrainedModel):
             # inputs_embeds = inputs_embeds * scale
             # Optional layernorm after injection for stability
             inputs_embeds = torch.where(numbers_mask.unsqueeze(-1), inputs_embeds * coord_proj, inputs_embeds)
-            inputs_embeds = F.layer_norm(inputs_embeds, (inputs_embeds.shape[-1],))
+            # inputs_embeds = F.layer_norm(inputs_embeds, (inputs_embeds.shape[-1],))
 
         outputs = self.language_model(
             input_ids=None,
@@ -1034,77 +1032,87 @@ class LeLNumberHead(nn.Module):
         if hidden_dim is None:
             hidden_dim = input_dim // 2
         self.coord_scale = coord_scale
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.GELU(),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.Linear(hidden_dim // 2, 5),
-        )
+
+        self.linear1 = nn.Linear(input_dim, hidden_dim)
+        self.gelu1 = nn.GELU()
+        self.norm1 = nn.LayerNorm(hidden_dim)
+
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.gelu2 = nn.GELU()
+        self.norm2 = nn.LayerNorm(hidden_dim // 2)
+
+        self.linear3 = nn.Linear(hidden_dim // 2, 5)  # xmin, ymin, xmax, ymax, angle
+
         self._init_weights()
 
     def _init_weights(self):
-        for m in self.mlp:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.8)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+        """Initialisation adaptée aux coordonnées réelles"""
+        for module in [self.linear1, self.linear2]:
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        # Initialisation plus petite pour la couche finale
+        nn.init.xavier_uniform_(self.linear3.weight, gain=0.1)
+        if self.linear3.bias is not None:
+            nn.init.zeros_(self.linear3.bias)
+        with torch.no_grad():
+            # Biais adaptés à l'échelle réelle de vos données
+            self.linear3.bias[0] = 0.5   # xmin (proche centre si coord_scale=2)
+            self.linear3.bias[1] = 0.5   # ymin
+            self.linear3.bias[2] = 1.5   # xmax (proche centre + taille)
+            self.linear3.bias[3] = 1.5   # ymax
+            self.linear3.bias[4] = 0.0   # angle
 
     def forward(self, hidden_subset: torch.Tensor) -> torch.Tensor:
-        # hidden_subset peut être bf16 -> on fait les couches en float32 puis on recaste
         orig_dtype = hidden_subset.dtype
         x = hidden_subset.float()
-        x = self.mlp(x)
-        cx, cy, w, h, ang = x.split(1, dim=-1)
-        cx = torch.sigmoid(cx) * self.coord_scale
-        cy = torch.sigmoid(cy) * self.coord_scale
-        w = torch.sigmoid(w) * self.coord_scale
-        h = torch.sigmoid(h) * self.coord_scale
-        ang = torch.tanh(ang) * (math.pi / 2)
-        out = torch.cat([cx, cy, w, h, ang], dim=-1)
+        x = self.linear1(x)
+        x = self.gelu1(x)
+        x = self.norm1(x)
+        x = self.linear2(x)
+        x = self.gelu2(x)
+        x = self.norm2(x)
+        x = self.linear3(x)
+
+        xmin, ymin, xmax, ymax, angle = x.split(1, dim=-1)
+        xmin = torch.sigmoid(xmin) * self.coord_scale
+        ymin = torch.sigmoid(ymin) * self.coord_scale
+        xmax = torch.sigmoid(xmax) * self.coord_scale
+        ymax = torch.sigmoid(ymax) * self.coord_scale
+        angle = torch.tanh(angle) * (math.pi / 2)
+
+        out = torch.cat([xmin, ymin, xmax, ymax, angle], dim=-1)
         return out.to(orig_dtype)
 
 class StableKLDLocalizationLoss(nn.Module):
-    """
-    Stable localisation loss for boxes in xyxya = (xmin, ymin, xmax, ymax, angle).
-
-    Features:
-      - Analytic KL (no matrix inversion)
-      - Optional symmetric KL
-      - SmoothL1 on raw xyxya
-      - Axis-aligned IoU metric
-      - NaN / inf guards
-      - Optional warmup on KLD weight
-    """
     def __init__(
         self,
         l1_weight: float = 1.0,
         kld_weight: float = 1.0,
         eps: float = 1e-7,
         symmetric: bool = False,
-        kld_warmup_steps: int = 0  # if >0, scale kld_weight by (current_step / kld_warmup_steps) clipped to 1
+        kld_warmup_steps: int = 0,
     ):
         super().__init__()
-        self.l1_weight = l1_weight
-        self.base_kld_weight = kld_weight
-        self.eps = eps
-        self.symmetric = symmetric
-        self.kld_warmup_steps = kld_warmup_steps
+        self.l1_weight = float(l1_weight)
+        self.base_kld_weight = float(kld_weight)
+        self.eps = float(eps)
+        self.symmetric = bool(symmetric)
+        self.kld_warmup_steps = int(kld_warmup_steps)
 
-        # last components
+        # stockage monitoring
         self._last_kld = None
         self._last_l1 = None
         self._last_iou_metric = None
+        self._last_weighted = None
 
-        # internal step tracker (can be updated externally)
         self.register_buffer("step", torch.zeros((), dtype=torch.long), persistent=False)
 
     @staticmethod
     def _xyxya_to_params(boxes: torch.Tensor, eps: float):
+        """Convertit xyxya -> (cx,cy,w,h,a,x1c,y1c,x2c,y2c)."""
         x1, y1, x2, y2, a = boxes.unbind(-1)
-        # enforce ordering to avoid negative widths/heights
         x1c = torch.minimum(x1, x2)
         x2c = torch.maximum(x1, x2)
         y1c = torch.minimum(y1, y2)
@@ -1116,56 +1124,31 @@ class StableKLDLocalizationLoss(nn.Module):
         return cx, cy, w, h, a, x1c, y1c, x2c, y2c
 
     @staticmethod
-    def _axis_aligned_iou(x1p, y1p, x2p, y2p, x1t, y1t, x2t, y2t, eps: float):
-        inter_x1 = torch.maximum(x1p, x1t)
-        inter_y1 = torch.maximum(y1p, y1t)
-        inter_x2 = torch.minimum(x2p, x2t)
-        inter_y2 = torch.minimum(y2p, y2t)
-
-        inter_w = (inter_x2 - inter_x1).clamp(min=0)
-        inter_h = (inter_y2 - inter_y1).clamp(min=0)
-        inter = inter_w * inter_h
-
-        ap = (x2p - x1p).clamp(min=0) * (y2p - y1p).clamp(min=0)
-        at = (x2t - x1t).clamp(min=0) * (y2t - y1t).clamp(min=0)
-        union = ap + at - inter + eps
-        return inter / union
-
-    @staticmethod
     def _analytic_kl_one_way(cx_p, cy_p, w_p, h_p, a_p,
                              cx_q, cy_q, w_q, h_q, a_q,
-                             eps):
-        # KL(P||Q)
-        # Ensure minimal size
+                             eps: float):
+        """
+        KL(P || Q) pour des gaussiennes 2D orientées.
+        P: (cx_p, cy_p, w_p, h_p, a_p), Q: (cx_q, cy_q, w_q, h_q, a_q)
+        """
         w_p = w_p.clamp(min=eps)
         h_p = h_p.clamp(min=eps)
         w_q = w_q.clamp(min=eps)
         h_q = h_q.clamp(min=eps)
 
-        # Precompute
-        # a1, a2 eigenvalues of Sigma_q^{-1}
         a1 = 4.0 / (w_q * w_q + eps)
         a2 = 4.0 / (h_q * h_q + eps)
-        # b1, b2 eigenvalues of Sigma_p
         b1 = (w_p * w_p) / 4.0
         b2 = (h_p * h_p) / 4.0
 
-        # angle difference
         phi = a_p - a_q
         c = torch.cos(phi)
         s = torch.sin(phi)
         c2 = c * c
         s2 = s * s
 
-        # trace term
-        # trace( Sigma_q^{-1} Sigma_p ) =
-        # a1*(b1 c^2 + b2 s^2) + a2*(b1 s^2 + b2 c^2)
         trace_term = a1 * (b1 * c2 + b2 * s2) + a2 * (b1 * s2 + b2 * c2)
 
-        # mahal term:
-        # diff' = R_q^T (mu_q - mu_p)
-        # R_q^T = [[ cos(a_q), sin(a_q)],
-        #          [-sin(a_q), cos(a_q)]]
         caq = torch.cos(a_q)
         saq = torch.sin(a_q)
         dx = (cx_q - cx_p)
@@ -1174,7 +1157,6 @@ class StableKLDLocalizationLoss(nn.Module):
         dqy = -saq * dx + caq * dy
         mahal = a1 * dqx * dqx + a2 * dqy * dqy
 
-        # log det ratio
         log_det_p = 2 * (torch.log(w_p + eps) + torch.log(h_p + eps)) - 2 * math.log(4.0)
         log_det_q = 2 * (torch.log(w_q + eps) + torch.log(h_q + eps)) - 2 * math.log(4.0)
         log_term = (log_det_q - log_det_p)
@@ -1182,28 +1164,167 @@ class StableKLDLocalizationLoss(nn.Module):
         kl = 0.5 * (trace_term + mahal - 2.0 + log_term)
         return torch.clamp(kl, min=0.0)
 
-    def forward(self, pred_boxes_xyxya: torch.Tensor, tgt_boxes_xyxya: torch.Tensor):
+    # -------------------- IoU orientée (pairwise) --------------------
+
+    @staticmethod
+    def _rect_polygon_from_params(cx: torch.Tensor, cy: torch.Tensor, w: torch.Tensor, h: torch.Tensor, angle: torch.Tensor):
+        """
+        Construit les 4 sommets d'un rectangle orienté (N,4,2) à partir de (cx,cy,w,h,angle).
+        """
+        hw = (w.clamp_min(0) * 0.5)
+        hh = (h.clamp_min(0) * 0.5)
+
+        cos_a = torch.cos(angle)
+        sin_a = torch.sin(angle)
+
+        xs = torch.stack([-hw, hw, hw, -hw], dim=-1)  # (N,4)
+        ys = torch.stack([-hh, -hh, hh, hh], dim=-1)  # (N,4)
+
+        x_rot = xs * cos_a.unsqueeze(-1) - ys * sin_a.unsqueeze(-1) + cx.unsqueeze(-1)
+        y_rot = xs * sin_a.unsqueeze(-1) + ys * cos_a.unsqueeze(-1) + cy.unsqueeze(-1)
+
+        return torch.stack([x_rot, y_rot], dim=-1)  # (N,4,2)
+
+    @staticmethod
+    def _polygon_area(poly: torch.Tensor) -> torch.Tensor:
+        """
+        Aire d'un polygone (M,2) via la formule de Shoelace. Retourne un scalaire Tensor.
+        """
+        if poly.numel() == 0:
+            return poly.new_zeros(())
+        x = poly[:, 0]
+        y = poly[:, 1]
+        return torch.abs(torch.sum(x * torch.roll(y, -1)) - torch.sum(y * torch.roll(x, -1))) * 0.5
+
+    @staticmethod
+    def _is_inside(pt: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> bool:
+        """
+        Test demi-plan pour le côté [a->b].
+        """
+        return ((b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0])) >= 0
+
+    @staticmethod
+    def _segment_intersection(p: torch.Tensor, q: torch.Tensor, a: torch.Tensor, b: torch.Tensor, eps: float) -> torch.Tensor:
+        """
+        Intersection du segment [p,q] avec la droite (a->b). Retourne un point (2).
+        """
+        d1 = q - p
+        d2 = b - a
+        denom = d1[0] * d2[1] - d1[1] * d2[0]
+        # éviter division par 0
+        denom = denom if torch.abs(denom) > eps else (d1.new_tensor(eps) if denom >= 0 else d1.new_tensor(-eps))
+        t = ((a[0] - p[0]) * d2[1] - (a[1] - p[1]) * d2[0]) / denom
+        return p + t * d1
+
+    @classmethod
+    def _clip_polygon(cls, subj: torch.Tensor, clip: torch.Tensor, eps: float) -> torch.Tensor:
+        """
+        Sutherland–Hodgman: découpe le polygone subj (M,2) par le polygone 'clip' (K,2).
+        Retour: polygone découpé (L,2).
+        """
+        out = subj
+        num_edges = clip.shape[0]
+        for i in range(num_edges):
+            if out.shape[0] == 0:
+                break
+            a = clip[i]
+            b = clip[(i + 1) % num_edges]
+            inp = out
+            out = out.new_zeros((0, 2))
+            s = inp[-1]
+            for e in inp:
+                e_in = cls._is_inside(e, a, b)
+                s_in = cls._is_inside(s, a, b)
+                if e_in:
+                    if not s_in:
+                        inter = cls._segment_intersection(s, e, a, b, eps)
+                        out = torch.cat([out, inter.unsqueeze(0)], dim=0)
+                    out = torch.cat([out, e.unsqueeze(0)], dim=0)
+                elif s_in:
+                    inter = cls._segment_intersection(s, e, a, b, eps)
+                    out = torch.cat([out, inter.unsqueeze(0)], dim=0)
+                s = e
+        return out
+
+    @classmethod
+    def _oriented_iou_pairwise_xyxya(cls, pred_xyxya: torch.Tensor, tgt_xyxya: torch.Tensor, eps: float) -> torch.Tensor:
+        """
+        IoU orientée PAIRE-À-PAIRE (1-1) entre deux tenseurs (N,5) xyxya (x1,y1,x2,y2,angle_rad).
+        Retourne la moyenne des IoU.
+        """
+        if pred_xyxya.numel() == 0:
+            return pred_xyxya.new_tensor(0.0)
+
+        cx_p, cy_p, w_p, h_p, a_p, _, _, _, _ = cls._xyxya_to_params(pred_xyxya, eps)
+        cx_t, cy_t, w_t, h_t, a_t, _, _, _, _ = cls._xyxya_to_params(tgt_xyxya, eps)
+
+        poly_p = cls._rect_polygon_from_params(cx_p, cy_p, w_p, h_p, a_p)
+        poly_t = cls._rect_polygon_from_params(cx_t, cy_t, w_t, h_t, a_t)
+
+        area_p = (w_p * h_p).clamp_min(0)
+        area_t = (w_t * h_t).clamp_min(0)
+
+        N = poly_p.shape[0]
+        ious = pred_xyxya.new_zeros((N,))
+        for i in range(N):
+            inter_poly = cls._clip_polygon(poly_p[i], poly_t[i], eps)
+            inter_area = cls._polygon_area(inter_poly)
+            union = area_p[i] + area_t[i] - inter_area + eps
+            ious[i] = torch.clamp(inter_area / union, 0.0, 1.0)
+
+        return ious.mean()
+
+    # -------------------- forward --------------------
+
+    def forward(self, pred_boxes_xyxya, tgt_boxes_xyxya, mask=None):
         if pred_boxes_xyxya.numel() == 0:
             zero = pred_boxes_xyxya.new_zeros(())
-            self._last_kld = zero
-            self._last_l1 = zero
-            self._last_iou_metric = zero
+            self._record(zero, zero, zero, zero)
             return zero
 
-        # Upcast to float32 for stability
-        dtype_out = pred_boxes_xyxya.dtype
-        pb = pred_boxes_xyxya.float()
-        tb = tgt_boxes_xyxya.float()
+        # Flatten + masque
+        if pred_boxes_xyxya.dim() == 3:
+            B, S, D = pred_boxes_xyxya.shape
+            pred = pred_boxes_xyxya.reshape(B * S, D)
+            tgt = tgt_boxes_xyxya.reshape(B * S, D)
+            if mask is not None:
+                m = mask
+                if m.dim() == 3 and m.shape[-1] == 1:
+                    m = m.squeeze(-1)
+                m = m.reshape(B * S).to(dtype=torch.bool, device=pred_boxes_xyxya.device)
+                valid_idx = torch.nonzero(m, as_tuple=False).squeeze(1)
+                if valid_idx.numel() == 0:
+                    zero = pred_boxes_xyxya.new_zeros(())
+                    self._record(zero, zero, zero, zero)
+                    return zero
+                pred = pred.index_select(0, valid_idx)
+                tgt  = tgt.index_select(0, valid_idx)
+        else:
+            pred = pred_boxes_xyxya
+            tgt  = tgt_boxes_xyxya
 
+        out_dtype = pred.dtype
+        pb = pred.float()
+        tb = tgt.float()
+
+        # Params
         cx_p, cy_p, w_p, h_p, a_p, x1p, y1p, x2p, y2p = self._xyxya_to_params(pb, self.eps)
         cx_t, cy_t, w_t, h_t, a_t, x1t, y1t, x2t, y2t = self._xyxya_to_params(tb, self.eps)
 
-        # Smooth L1 directement sur xyxya (après correction x1<x2 etc.)
-        packed_p = torch.stack([x1p, y1p, x2p, y2p, a_p], dim=-1)
-        packed_t = torch.stack([x1t, y1t, x2t, y2t, a_t], dim=-1)
-        l1 = F.smooth_l1_loss(packed_p, packed_t, reduction="mean")
+        # ---- L1 améliorée ----
+        # L1 sur coordonnées (xmin, ymin, xmax, ymax)
+        coords_p = torch.stack([x1p, y1p, x2p, y2p], dim=-1)
+        coords_t = torch.stack([x1t, y1t, x2t, y2t], dim=-1)
+        l1_coords = F.smooth_l1_loss(coords_p, coords_t, reduction="mean")
 
-        # KL
+        # L1 sur orientation encodée (cos, sin)
+        ang_p = torch.stack([torch.cos(a_p), torch.sin(a_p)], dim=-1)
+        ang_t = torch.stack([torch.cos(a_t), torch.sin(a_t)], dim=-1)
+        l1_angle = F.smooth_l1_loss(ang_p, ang_t, reduction="mean")
+
+        l1 = l1_coords + l1_angle
+
+        # ---- KL divergence ----
         kl_pt = self._analytic_kl_one_way(cx_p, cy_p, w_p, h_p, a_p,
                                           cx_t, cy_t, w_t, h_t, a_t,
                                           self.eps)
@@ -1214,56 +1335,50 @@ class StableKLDLocalizationLoss(nn.Module):
             kl_vals = 0.5 * (kl_pt + kl_tp)
         else:
             kl_vals = kl_pt
+        kl_mean = kl_vals.mean()
 
-        # IoU metric (axis aligned)
-        with torch.no_grad():
-            ious = self._axis_aligned_iou(x1p, y1p, x2p, y2p, x1t, y1t, x2t, y2t, self.eps)
-            iou_metric = ious.mean()
-
-        # Guard against non-finite
-        if not torch.isfinite(kl_vals).all():
-            kl_vals = torch.where(torch.isfinite(kl_vals), kl_vals, torch.zeros_like(kl_vals))
-
-        kld_mean = kl_vals.mean()
-
-        # Warmup schedule (optional)
+        # ---- Warmup KLD ----
         if self.kld_warmup_steps > 0 and self.base_kld_weight > 0:
-            # step peut être mis à jour depuis l'extérieur: loss.step += 1
-            warm_factor = (self.step.item() / float(self.kld_warmup_steps))
-            warm_factor = min(max(warm_factor, 0.0), 1.0)
+            warm = min(max(self.step.item() / float(self.kld_warmup_steps), 0.0), 1.0)
         else:
-            warm_factor = 1.0
+            warm = 1.0
 
-        total = self.l1_weight * l1 + (self.base_kld_weight * warm_factor) * kld_mean
+        total = self.l1_weight * l1 + (self.base_kld_weight * warm) * kl_mean
 
-        # Final NaN guard
+        # ---- IoU orientée (metric) ----
+        with torch.no_grad():
+            packed_p = torch.stack([x1p, y1p, x2p, y2p, a_p], dim=-1)
+            packed_t = torch.stack([x1t, y1t, x2t, y2t, a_t], dim=-1)
+            iou_metric = self._oriented_iou_pairwise_xyxya(packed_p, packed_t, self.eps)
+
+        # Sécurité
         if not torch.isfinite(total):
-            print("[StableKLDLocalizationLoss] WARNING: total loss NaN/Inf. l1=", l1.item(), "kld=", kld_mean.item())
-            total = torch.zeros((), device=pb.device)
+            print("[StableKLDLocalizationLoss] WARNING: total loss NaN/Inf.")
+            total = pb.new_zeros(())
 
-        # Store components
-        self._last_l1 = l1.detach().to(dtype_out)
-        self._last_kld = kld_mean.detach().to(dtype_out)
-        self._last_iou_metric = iou_metric.detach().to(dtype_out)
-        return total.to(dtype_out)
+        self._record(l1.detach().to(out_dtype), kl_mean.detach().to(out_dtype),
+                     iou_metric.detach().to(out_dtype), total.detach().to(out_dtype))
+        return total.to(out_dtype)
+
+    def _record(self, l1, kld, iou, weighted):
+        self._last_l1 = l1
+        self._last_kld = kld
+        self._last_iou_metric = iou
+        self._last_weighted = weighted
 
     def get_loss_components(self):
-        if self._last_kld is None:
-            zero = torch.tensor(0.0)
-            return {
-                "kld_loss": zero,
-                "l1_loss": zero,
-                "iou_metric": zero,
-            }
+        if self._last_l1 is None:
+            z = torch.tensor(0.0)
+            return {"l1_loss": z, "kld_loss": z, "iou_metric": z, "weighted_loss": z}
         return {
-            "kld_loss": self._last_kld,
             "l1_loss": self._last_l1,
+            "kld_loss": self._last_kld,
             "iou_metric": self._last_iou_metric,
+            "weighted_loss": self._last_weighted,
         }
 
     def advance_step(self, n: int = 1):
-        # Permet d'incrémenter le step depuis l'entraînement pour le warmup KLD
-        self.step += n
+        self.step += int(n)
 
 # ====================================================================================
 # Main Model for Conditional Generation with coordinate integration
@@ -1282,9 +1397,9 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.numbers_head = LeLNumberHead(config.hidden_size, config.hidden_size, coord_scale=2.0)
         # Localization loss (KLD + L1, IoU metric only)
-        self.localisation_loss = StableKLDLocalizationLoss(l1_weight=20.0, kld_weight=0.5)
+        self.localisation_loss = StableKLDLocalizationLoss(l1_weight=10.0, kld_weight=1, symmetric = False)
         # Flag controlling whether we shift for coordinate regression (False = predict at same position).
-        self.coordinate_shift = False
+        self.coordinate_shift = True
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1320,8 +1435,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        number_ids: Optional[torch.FloatTensor] = None,          # <- float
-        number_mask: Optional[torch.BoolTensor] = None,          # <- ajouté
+        number_ids: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
@@ -1348,8 +1462,7 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
 
         outputs = self.model(
             input_ids=input_ids,
-            number_ids=number_ids,               # <- déjà présent
-            number_mask=number_mask,             # <- propage vers le sous-modèle
+            number_ids=number_ids,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
             image_grid_thw=image_grid_thw,
@@ -1382,8 +1495,6 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             target_coord_mask = (text_labels == self.config.number_token_id)
             pred_filtered = logits_number[target_coord_mask]
             tgt_filtered = number_labels[target_coord_mask]
-            # number_loss = torch.sum(F.smooth_l1_loss(input=logits_number[:,:-1].squeeze(-1)*number_mask[:,1:],target=number_ids[:,1:]*number_mask[:,1:], reduction="none"))/torch.sum(number_mask)
-            # coord_loss = number_loss_fn(logits_number, number_label, number_mask)
             pred_fp32 = pred_filtered.float()
             tgt_fp32  = tgt_filtered.float()
             coord_loss = self.localisation_loss(pred_fp32, tgt_fp32)
@@ -1412,7 +1523,6 @@ class LeL2_ForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMixin):
             rope_deltas=outputs.rope_deltas,
         )
 
-    # prepare_inputs_for_generation unchanged except for passing through number_history / number_mask_history safely
     def prepare_inputs_for_generation(
         self,
         input_ids,
